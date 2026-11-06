@@ -36,17 +36,18 @@ void USlayHealthComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(USlayHealthComponent, MaxHealth);
 	DOREPLIFETIME(USlayHealthComponent, CurrentHealth);
+	DOREPLIFETIME(USlayHealthComponent, bIncapacitateAtZero);
 }
 
 bool USlayHealthComponent::CanChangeHealth(float Amount) const
 {
 	return HasBegunPlay() && GetOwner() && GetOwner()->HasAuthority()
-		&& FMath::IsFinite(Amount) && Amount > 0.0f && !IsDead();
+		&& FMath::IsFinite(Amount) && Amount > 0.0f;
 }
 
 float USlayHealthComponent::ApplyDamage(float Amount)
 {
-	if (!CanChangeHealth(Amount))
+	if (!CanChangeHealth(Amount) || IsDepleted())
 	{
 		return 0.0f;
 	}
@@ -59,7 +60,7 @@ float USlayHealthComponent::ApplyDamage(float Amount)
 
 float USlayHealthComponent::Heal(float Amount)
 {
-	if (!CanChangeHealth(Amount))
+	if (!CanChangeHealth(Amount) || (IsDepleted() && !(bIncapacitateAtZero && bAllowHealingRecovery)))
 	{
 		return 0.0f;
 	}
@@ -69,6 +70,18 @@ float USlayHealthComponent::Heal(float Amount)
 	const float Applied = CurrentHealth - PreviousHealth;
 	NotifyHealthChanged(PreviousHealth);
 	return Applied;
+}
+
+bool USlayHealthComponent::RecoverFromIncapacitation(float HealthFraction)
+{
+	if (!CanChangeHealth(HealthFraction) || !bIncapacitateAtZero || !IsDepleted())
+	{
+		return false;
+	}
+	const float PreviousHealth = CurrentHealth;
+	CurrentHealth = MaxHealth * FMath::Clamp(HealthFraction, 0.001f, 1.0f);
+	NotifyHealthChanged(PreviousHealth);
+	return true;
 }
 
 void USlayHealthComponent::HandleAnyDamage(AActor* DamagedActor, float Damage,
@@ -88,7 +101,7 @@ void USlayHealthComponent::NotifyHealthChanged(float PreviousHealth)
 	if (PreviousHealth != NewHealth)
 	{
 		OnHealthChanged.Broadcast(PreviousHealth, NewHealth);
-		if (PreviousHealth > 0.0f && NewHealth <= 0.0f)
+		if (PreviousHealth > 0.0f && NewHealth <= 0.0f && !bIncapacitateAtZero)
 		{
 			OnDeath.Broadcast();
 		}
