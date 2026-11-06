@@ -8,11 +8,15 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/Guid.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
+#include "SLAYCREW.h"
 #include "StaticMeshResources.h"
 #include "UObject/Linker.h"
 #include "UObject/Package.h"
+#include "UObject/PackageFileSummary.h"
 #include "UObject/UObjectGlobals.h"
 
 namespace
@@ -34,17 +38,64 @@ namespace
 
 	bool ConvertGamePackageToFilename(const FString& BaseContentDir, const FName& PackageName, FString& OutFilename)
 	{
+		OutFilename.Reset();
+		if (BaseContentDir.IsEmpty() || PackageName.IsNone())
+		{
+			return false;
+		}
+
 		const FString PackageStr = PackageName.ToString();
 		const FString GamePrefix = TEXT("/Game/");
-		if (!PackageStr.StartsWith(GamePrefix, ESearchCase::IgnoreCase))
+		if (!PackageStr.StartsWith(GamePrefix, ESearchCase::IgnoreCase) || PackageStr.Contains(TEXT("..")))
+		{
+			return false;
+		}
+
+		FText Reason;
+		if (!FPackageName::IsValidLongPackageName(PackageStr, /*bIncludeReadOnlyRoots=*/false, &Reason))
 		{
 			return false;
 		}
 
 		const FString RelativePath = PackageStr.RightChop(GamePrefix.Len()) + TEXT(".uasset");
-		OutFilename = FPaths::Combine(BaseContentDir, RelativePath);
+		if (RelativePath.IsEmpty() || RelativePath == TEXT(".uasset"))
+		{
+			return false;
+		}
+
+		FString NormalizedBase = FPaths::ConvertRelativePathToFull(BaseContentDir);
+		FPaths::NormalizeDirectoryName(NormalizedBase);
+
+		OutFilename = FPaths::ConvertRelativePathToFull(FPaths::Combine(NormalizedBase, RelativePath));
 		FPaths::NormalizeFilename(OutFilename);
+
+		if (!FPaths::ValidatePath(OutFilename) || !FPaths::IsUnderDirectory(OutFilename, NormalizedBase))
+		{
+			OutFilename.Reset();
+			return false;
+		}
+
 		return true;
+	}
+
+	bool HasValidUnrealPackageHeader(const FString& Filename)
+	{
+		TUniquePtr<FArchive> FileReader(IFileManager::Get().CreateFileReader(*Filename));
+		if (!FileReader || FileReader->TotalSize() < static_cast<int64>(sizeof(uint32)))
+		{
+			return false;
+		}
+
+		uint32 Tag = 0;
+		*FileReader << Tag;
+		return (!FileReader->IsError()) && (Tag == PACKAGE_FILE_TAG || Tag == PACKAGE_FILE_TAG_SWAPPED);
+	}
+
+	double SnapAxisScalePreservingMirror(double AxisScale, double ScaleStep)
+	{
+		const double Sign = (AxisScale < 0.0) ? -1.0 : 1.0;
+		const double SnappedMagnitude = FMath::Max(ScaleStep, FMath::GridSnap(FMath::Abs(AxisScale), ScaleStep));
+		return Sign * SnappedMagnitude;
 	}
 }
 
@@ -532,7 +583,7 @@ FTransform USLAYCREWEnvironmentKitCatalog::SnapTransformToModularGrid(
 	const float PosStep = FMath::Max(SnapSpec.PositionGridStepCm, 1.0f);
 	const float VertStep = FMath::Max(SnapSpec.VerticalGridStepCm, 1.0f);
 	const float RotStep = FMath::Max(SnapSpec.RotationGridStepDegrees, 1.0f);
-	const float ScaleStep = FMath::Max(SnapSpec.ScaleGridStep, 0.01f);
+	const double ScaleStep = static_cast<double>(FMath::Max(SnapSpec.ScaleGridStep, 0.01f));
 
 	const FVector Loc = InTransform.GetLocation();
 	const FVector SnappedLoc(
@@ -548,11 +599,27 @@ FTransform USLAYCREWEnvironmentKitCatalog::SnapTransformToModularGrid(
 
 	const FVector Scale = InTransform.GetScale3D();
 	const FVector SnappedScale(
-		FMath::Max(ScaleStep, FMath::GridSnap(Scale.X, ScaleStep)),
-		FMath::Max(ScaleStep, FMath::GridSnap(Scale.Y, ScaleStep)),
-		FMath::Max(ScaleStep, FMath::GridSnap(Scale.Z, ScaleStep)));
+		SnapAxisScalePreservingMirror(Scale.X, ScaleStep),
+		SnapAxisScalePreservingMirror(Scale.Y, ScaleStep),
+		SnapAxisScalePreservingMirror(Scale.Z, ScaleStep));
 
 	return FTransform(SnappedRot, SnappedLoc, SnappedScale);
+}
+
+bool USLAYCREWEnvironmentKitCatalog::HasValidModularScale(
+	const FTransform& InTransform,
+	const FSLAYCREWModularSnapSpec& SnapSpec)
+{
+	if (!InTransform.IsValid())
+	{
+		return false;
+	}
+
+	const double MinMagnitude = static_cast<double>(FMath::Max(SnapSpec.ScaleGridStep, 0.01f)) * 0.5;
+	const FVector Scale = InTransform.GetScale3D();
+	return FMath::Abs(Scale.X) >= MinMagnitude
+		&& FMath::Abs(Scale.Y) >= MinMagnitude
+		&& FMath::Abs(Scale.Z) >= MinMagnitude;
 }
 
 bool USLAYCREWEnvironmentKitCatalog::IsTransformAlignedToGrid(
@@ -560,6 +627,11 @@ bool USLAYCREWEnvironmentKitCatalog::IsTransformAlignedToGrid(
 	const FSLAYCREWModularSnapSpec& SnapSpec,
 	float Tolerance)
 {
+	if (!HasValidModularScale(InTransform, SnapSpec))
+	{
+		return false;
+	}
+
 	const FTransform Snapped = SnapTransformToModularGrid(InTransform, SnapSpec);
 	if (!InTransform.GetLocation().Equals(Snapped.GetLocation(), Tolerance))
 	{
@@ -585,12 +657,22 @@ bool USLAYCREWEnvironmentKitCatalog::ResolveSourcePackageDependencies(
 
 	if (SourceContentDir.IsEmpty() || !IFileManager::Get().DirectoryExists(*SourceContentDir))
 	{
+		OutReport.FailureReason = FString::Printf(
+			TEXT("Source Content directory does not exist: '%s'"),
+			*SourceContentDir);
+		return false;
+	}
+
+	if (RootPackageNames.IsEmpty())
+	{
+		OutReport.FailureReason = TEXT("RootPackageNames list is empty.");
 		return false;
 	}
 
 	IAssetRegistry* AssetRegistry = IAssetRegistry::Get();
 	if (!AssetRegistry)
 	{
+		OutReport.FailureReason = TEXT("IAssetRegistry is unavailable.");
 		return false;
 	}
 
@@ -599,7 +681,23 @@ bool USLAYCREWEnvironmentKitCatalog::ResolveSourcePackageDependencies(
 
 	for (const FName& RootPkg : RootPackageNames)
 	{
-		if (!RootPkg.IsNone() && !VisitedPackages.Contains(RootPkg))
+		if (RootPkg.IsNone())
+		{
+			OutReport.UnsupportedDependencies.AddUnique(FName(TEXT("<None>")));
+			continue;
+		}
+
+		const FString RootStr = RootPkg.ToString();
+		FText ValidateReason;
+		if (!RootStr.StartsWith(TEXT("/Game/"), ESearchCase::IgnoreCase) ||
+			RootStr.Contains(TEXT("..")) ||
+			!FPackageName::IsValidLongPackageName(RootStr, /*bIncludeReadOnlyRoots=*/false, &ValidateReason))
+		{
+			OutReport.UnsupportedDependencies.AddUnique(RootPkg);
+			continue;
+		}
+
+		if (!VisitedPackages.Contains(RootPkg))
 		{
 			VisitedPackages.Add(RootPkg);
 			PackageQueue.Enqueue(RootPkg);
@@ -612,6 +710,7 @@ bool USLAYCREWEnvironmentKitCatalog::ResolveSourcePackageDependencies(
 		FString SourceFilename;
 		if (!ConvertGamePackageToFilename(SourceContentDir, CurrentPkg, SourceFilename))
 		{
+			OutReport.UnsupportedDependencies.AddUnique(CurrentPkg);
 			continue;
 		}
 
@@ -622,33 +721,127 @@ bool USLAYCREWEnvironmentKitCatalog::ResolveSourcePackageDependencies(
 			continue;
 		}
 
+		if (!HasValidUnrealPackageHeader(SourceFilename))
+		{
+			OutReport.UnreadablePackages.AddUnique(CurrentPkg);
+			continue;
+		}
+
+		IAssetRegistry::FLoadPackageRegistryData LoadData(/*bInGetDependencies=*/true);
+		AssetRegistry->LoadPackageRegistryData(SourceFilename, LoadData);
+		if (LoadData.Data.IsEmpty())
+		{
+			OutReport.UnreadablePackages.AddUnique(CurrentPkg);
+			continue;
+		}
+
 		OutReport.ResolvedDependencyPackages.Add(CurrentPkg);
 		OutReport.TotalFiles++;
 		OutReport.TotalBytes += FileSize;
 
-		IAssetRegistry::FLoadPackageRegistryData LoadData(/*bInGetDependencies=*/true);
-		AssetRegistry->LoadPackageRegistryData(SourceFilename, LoadData);
-
 		for (const FName& DepPkg : LoadData.DataDependencies)
 		{
-			const FString DepStr = DepPkg.ToString();
-			if (DepStr.StartsWith(TEXT("/Game/"), ESearchCase::IgnoreCase) && !VisitedPackages.Contains(DepPkg))
+			if (DepPkg.IsNone())
 			{
-				VisitedPackages.Add(DepPkg);
-				PackageQueue.Enqueue(DepPkg);
+				continue;
+			}
+
+			const FString DepStr = DepPkg.ToString();
+			if (DepStr.StartsWith(TEXT("/Game/"), ESearchCase::IgnoreCase))
+			{
+				FText ValidateReason;
+				if (DepStr.Contains(TEXT("..")) ||
+					!FPackageName::IsValidLongPackageName(DepStr, /*bIncludeReadOnlyRoots=*/false, &ValidateReason))
+				{
+					OutReport.UnsupportedDependencies.AddUnique(DepPkg);
+					continue;
+				}
+
+				if (!VisitedPackages.Contains(DepPkg))
+				{
+					VisitedPackages.Add(DepPkg);
+					PackageQueue.Enqueue(DepPkg);
+				}
+			}
+			else if (DepStr.StartsWith(TEXT("/Engine/"), ESearchCase::IgnoreCase))
+			{
+				OutReport.EngineAndScriptDependencies.AddUnique(DepPkg);
+				if (!FPackageName::DoesPackageExist(DepStr))
+				{
+					OutReport.MissingPackages.AddUnique(DepPkg);
+				}
+			}
+			else if (DepStr.StartsWith(TEXT("/Script/"), ESearchCase::IgnoreCase))
+			{
+				OutReport.EngineAndScriptDependencies.AddUnique(DepPkg);
+				if (FindObject<UPackage>(nullptr, *DepStr) == nullptr)
+				{
+					OutReport.UnsupportedDependencies.AddUnique(DepPkg);
+				}
+			}
+			else
+			{
+				const FString MountPointRoot = FPackageName::GetPackageMountPoint(DepStr).ToString();
+				if (MountPointRoot.IsEmpty() ||
+					!FPackageName::MountPointExists(MountPointRoot) ||
+					!FPackageName::DoesPackageExist(DepStr))
+				{
+					OutReport.UnsupportedDependencies.AddUnique(DepPkg);
+				}
+				else
+				{
+					OutReport.EngineAndScriptDependencies.AddUnique(DepPkg);
+				}
 			}
 		}
 	}
 
 	OutReport.ResolvedDependencyPackages.Sort(FNameLexicalLess());
-	return OutReport.MissingPackages.IsEmpty() && OutReport.TotalFiles > 0;
+	OutReport.EngineAndScriptDependencies.Sort(FNameLexicalLess());
+	OutReport.MissingPackages.Sort(FNameLexicalLess());
+	OutReport.UnreadablePackages.Sort(FNameLexicalLess());
+	OutReport.UnsupportedDependencies.Sort(FNameLexicalLess());
+
+	OutReport.bCompleteDependencyCoverageVerified =
+		(RootPackageNames.Num() > 0) &&
+		(OutReport.TotalFiles >= RootPackageNames.Num()) &&
+		OutReport.MissingPackages.IsEmpty() &&
+		OutReport.UnreadablePackages.IsEmpty() &&
+		OutReport.UnsupportedDependencies.IsEmpty();
+
+	if (!OutReport.bCompleteDependencyCoverageVerified)
+	{
+		OutReport.FailureReason = FString::Printf(
+			TEXT("Dependency verification incomplete (Resolved=%d, Missing=%d, Unreadable=%d, Unsupported=%d)."),
+			OutReport.TotalFiles,
+			OutReport.MissingPackages.Num(),
+			OutReport.UnreadablePackages.Num(),
+			OutReport.UnsupportedDependencies.Num());
+		UE_LOG(LogSLAYCREW, Warning, TEXT("[GothicEnvironmentKit] %s"), *OutReport.FailureReason);
+		return false;
+	}
+
+	return true;
+}
+
+bool USLAYCREWEnvironmentKitCatalog::CleanUpAbandonedStagingSandboxes()
+{
+	const FString SandboxBaseDir = FPaths::ConvertRelativePathToFull(
+		FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Temp/GothicKitSandbox")));
+	if (!IFileManager::Get().DirectoryExists(*SandboxBaseDir))
+	{
+		return true;
+	}
+
+	return IFileManager::Get().DeleteDirectory(*SandboxBaseDir, /*RequireExists=*/false, /*Tree=*/true);
 }
 
 bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 	const FString& SourceContentDir,
 	const TArray<FName>& RootPackageNames,
 	FSLAYCREWPackageDependencyReport& OutReport,
-	bool bCleanUpStagedFilesOnExit)
+	bool bCleanUpStagedFilesOnExit,
+	const FString& OptionalCustomSandboxContentDir)
 {
 	if (!ResolveSourcePackageDependencies(SourceContentDir, RootPackageNames, OutReport))
 	{
@@ -658,15 +851,77 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 	IAssetRegistry* AssetRegistry = IAssetRegistry::Get();
 	if (!AssetRegistry)
 	{
+		OutReport.FailureReason = TEXT("IAssetRegistry is unavailable.");
 		return false;
 	}
 
-	const FString TargetContentDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
+	FString NormalizedSourceDir = FPaths::ConvertRelativePathToFull(SourceContentDir);
+	FPaths::NormalizeDirectoryName(NormalizedSourceDir);
+
+	FString ActiveProjectContentDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
+	FPaths::NormalizeDirectoryName(ActiveProjectContentDir);
+
+	const FString RunId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	const FString DefaultSandboxRunRoot = FPaths::ConvertRelativePathToFull(
+		FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Temp/GothicKitSandbox"), RunId));
+
+	FString SandboxContentDir = OptionalCustomSandboxContentDir.IsEmpty()
+		? FPaths::Combine(DefaultSandboxRunRoot, TEXT("Content"))
+		: FPaths::ConvertRelativePathToFull(OptionalCustomSandboxContentDir);
+	FPaths::NormalizeDirectoryName(SandboxContentDir);
+
+	OutReport.SandboxDirectoryUsed = SandboxContentDir;
+
+	if (!FPaths::ValidatePath(SandboxContentDir) ||
+		FPaths::IsSamePath(NormalizedSourceDir, SandboxContentDir) ||
+		FPaths::IsUnderDirectory(SandboxContentDir, NormalizedSourceDir) ||
+		FPaths::IsUnderDirectory(NormalizedSourceDir, SandboxContentDir))
+	{
+		OutReport.FailureReason = FString::Printf(
+			TEXT("Unsafe or overlapping sandbox directory '%s' relative to source '%s'."),
+			*SandboxContentDir,
+			*NormalizedSourceDir);
+		return false;
+	}
+
+	// Pre-flight collision detection: never overwrite existing assets in ActiveProjectContentDir or SandboxContentDir.
+	for (const FName& PkgName : OutReport.ResolvedDependencyPackages)
+	{
+		FString ActiveGameFile;
+		if (ConvertGamePackageToFilename(ActiveProjectContentDir, PkgName, ActiveGameFile) &&
+			IFileManager::Get().FileExists(*ActiveGameFile))
+		{
+			OutReport.CollidingPackages.AddUnique(PkgName);
+		}
+
+		FString SandboxFile;
+		if (ConvertGamePackageToFilename(SandboxContentDir, PkgName, SandboxFile) &&
+			IFileManager::Get().FileExists(*SandboxFile))
+		{
+			OutReport.CollidingPackages.AddUnique(PkgName);
+		}
+	}
+
+	if (!OutReport.CollidingPackages.IsEmpty())
+	{
+		OutReport.CollidingPackages.Sort(FNameLexicalLess());
+		OutReport.FailureReason = FString::Printf(
+			TEXT("Aborted before staging: %d package path collision(s) detected (first: '%s'). Existing assets are never overwritten."),
+			OutReport.CollidingPackages.Num(),
+			*OutReport.CollidingPackages[0].ToString());
+		UE_LOG(LogSLAYCREW, Warning, TEXT("[GothicEnvironmentKit] %s"), *OutReport.FailureReason);
+		return false;
+	}
+
 	TArray<FString> NewlyStagedFiles;
 	TArray<FString> NewlyCreatedDirs;
 	TArray<FString> AllTargetPackageFiles;
 	TArray<UPackage*> LoadedStagedPackages;
+	bool bMountPointRegistered = false;
 
+	// Note: If the process terminates abnormally (e.g. OS kill or hardware power loss), files staged in
+	// Saved/Temp/GothicKitSandbox outside ProjectContentDir can be cleaned up on next startup via
+	// USLAYCREWEnvironmentKitCatalog::CleanUpAbandonedStagingSandboxes().
 	ON_SCOPE_EXIT
 	{
 		if (bCleanUpStagedFilesOnExit)
@@ -687,12 +942,17 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 				}
 			}
 
+			if (bMountPointRegistered)
+			{
+				FPackageName::UnRegisterMountPoint(TEXT("/Game/"), SandboxContentDir);
+				bMountPointRegistered = false;
+			}
+
 			for (const FString& StagedFile : NewlyStagedFiles)
 			{
 				IFileManager::Get().Delete(*StagedFile, /*RequireExists=*/false, /*EvenReadOnly=*/true, /*Quiet=*/true);
 			}
 
-			// Remove newly created directories from deepest to shallowest if empty
 			NewlyCreatedDirs.Sort([](const FString& A, const FString& B) { return A.Len() > B.Len(); });
 			for (const FString& Dir : NewlyCreatedDirs)
 			{
@@ -703,41 +963,101 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 					IFileManager::Get().DeleteDirectory(*Dir, /*RequireExists=*/false, /*Tree=*/true);
 				}
 			}
+
+			if (OptionalCustomSandboxContentDir.IsEmpty() && IFileManager::Get().DirectoryExists(*DefaultSandboxRunRoot))
+			{
+				IFileManager::Get().DeleteDirectory(*DefaultSandboxRunRoot, /*RequireExists=*/false, /*Tree=*/true);
+			}
 		}
 	};
 
-	// 1. Stage all dependency-resolved .uasset files into /Game/... paths
+	// 1. Ensure sandbox root exists and stage all dependency-resolved .uasset files into SandboxContentDir
+	if (!IFileManager::Get().MakeDirectory(*SandboxContentDir, /*Tree=*/true) ||
+		!IFileManager::Get().DirectoryExists(*SandboxContentDir))
+	{
+		OutReport.FailureReason = FString::Printf(
+			TEXT("Failed to create sandbox Content directory '%s'."),
+			*SandboxContentDir);
+		return false;
+	}
+	NewlyCreatedDirs.AddUnique(SandboxContentDir);
+
 	for (const FName& PkgName : OutReport.ResolvedDependencyPackages)
 	{
 		FString SrcFile;
 		FString DstFile;
-		if (!ConvertGamePackageToFilename(SourceContentDir, PkgName, SrcFile) ||
-			!ConvertGamePackageToFilename(TargetContentDir, PkgName, DstFile))
+		if (!ConvertGamePackageToFilename(NormalizedSourceDir, PkgName, SrcFile) ||
+			!ConvertGamePackageToFilename(SandboxContentDir, PkgName, DstFile))
 		{
+			OutReport.FailureReason = FString::Printf(
+				TEXT("Invalid source or destination path for package '%s'."),
+				*PkgName.ToString());
+			return false;
+		}
+
+		const int64 ExpectedFileSize = IFileManager::Get().FileSize(*SrcFile);
+		if (ExpectedFileSize <= 0)
+		{
+			OutReport.FailureReason = FString::Printf(
+				TEXT("Source file missing or empty prior to copy: '%s'."),
+				*SrcFile);
+			return false;
+		}
+
+		if (IFileManager::Get().FileExists(*DstFile))
+		{
+			OutReport.CollidingPackages.AddUnique(PkgName);
+			OutReport.FailureReason = FString::Printf(
+				TEXT("Destination file already exists, refusing to overwrite: '%s'."),
+				*DstFile);
+			return false;
+		}
+
+		const FString DstDir = FPaths::GetPath(DstFile);
+		FString CheckDir = DstDir;
+		while (CheckDir.Len() > SandboxContentDir.Len() && !IFileManager::Get().DirectoryExists(*CheckDir))
+		{
+			NewlyCreatedDirs.AddUnique(CheckDir);
+			CheckDir = FPaths::GetPath(CheckDir);
+		}
+
+		if (!IFileManager::Get().MakeDirectory(*DstDir, /*Tree=*/true) ||
+			!IFileManager::Get().DirectoryExists(*DstDir))
+		{
+			OutReport.FailureReason = FString::Printf(
+				TEXT("Failed to create destination directory '%s' for package '%s'."),
+				*DstDir,
+				*PkgName.ToString());
+			return false;
+		}
+
+		const uint32 CopyResult = IFileManager::Get().Copy(*DstFile, *SrcFile, /*Replace=*/false, /*EvenIfReadOnly=*/true);
+		if (CopyResult != COPY_OK)
+		{
+			OutReport.FailureReason = FString::Printf(
+				TEXT("File copy failed (code %u) from '%s' to '%s'."),
+				CopyResult,
+				*SrcFile,
+				*DstFile);
+			return false;
+		}
+
+		NewlyStagedFiles.Add(DstFile);
+		if (IFileManager::Get().FileSize(*DstFile) != ExpectedFileSize)
+		{
+			OutReport.FailureReason = FString::Printf(
+				TEXT("Copied file size mismatch for '%s'."),
+				*DstFile);
 			return false;
 		}
 
 		AllTargetPackageFiles.Add(DstFile);
-
-		if (!IFileManager::Get().FileExists(*DstFile))
-		{
-			FString DstDir = FPaths::GetPath(DstFile);
-			FString CheckDir = DstDir;
-			while (CheckDir.Len() > TargetContentDir.Len() && !IFileManager::Get().DirectoryExists(*CheckDir))
-			{
-				NewlyCreatedDirs.AddUnique(CheckDir);
-				CheckDir = FPaths::GetPath(CheckDir);
-			}
-
-			if (IFileManager::Get().Copy(*DstFile, *SrcFile, /*Replace=*/false, /*EvenIfReadOnly=*/true) != COPY_OK)
-			{
-				return false;
-			}
-			NewlyStagedFiles.Add(DstFile);
-		}
 	}
 
-	// 2. Register staged files in UE 5.8 AssetRegistry
+	// 2. Temporarily mount SandboxContentDir to /Game/ and scan staged files in UE 5.8 AssetRegistry
+	FPackageName::RegisterMountPoint(TEXT("/Game/"), SandboxContentDir);
+	bMountPointRegistered = true;
+
 	AssetRegistry->ScanFilesSynchronous(AllTargetPackageFiles, /*bForceRescan=*/true);
 
 	// 3. Load and verify each root asset in UE 5.8
@@ -748,7 +1068,7 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 		Info.PackageName = RootPkg;
 
 		FString SrcFile;
-		ConvertGamePackageToFilename(SourceContentDir, RootPkg, SrcFile);
+		ConvertGamePackageToFilename(NormalizedSourceDir, RootPkg, SrcFile);
 		IAssetRegistry::FLoadPackageRegistryData RootData(/*bInGetDependencies=*/false);
 		AssetRegistry->LoadPackageRegistryData(SrcFile, RootData);
 
@@ -815,6 +1135,11 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 		}
 
 		OutReport.VerifiedAssets.Add(MoveTemp(Info));
+	}
+
+	if (!bAllRootsVerified && OutReport.FailureReason.IsEmpty())
+	{
+		OutReport.FailureReason = TEXT("One or more root packages failed to load or validate in UE 5.8.");
 	}
 
 	return bAllRootsVerified;

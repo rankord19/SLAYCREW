@@ -3,14 +3,18 @@
 #include "CoreMinimal.h"
 #include "Environment/SLAYCREWEnvironmentKitCatalog.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformMisc.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Guid.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSLAYCREWEnvironmentKitCatalogTest,
-	"SLAYCREW.Environment.GothicKit.CatalogAndGridSnapping",
+	"SLAYCREW.Environment.GothicKit.Portable.CatalogAndGridSnapping",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 bool FSLAYCREWEnvironmentKitCatalogTest::RunTest(const FString& Parameters)
@@ -75,12 +79,165 @@ bool FSLAYCREWEnvironmentKitCatalogTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Snapped Z == 400 cm"), SnappedTransform.GetLocation().Z, 400.0);
 	TestEqual(TEXT("Snapped Yaw == 90 deg"), SnappedTransform.Rotator().Yaw, 90.0);
 
+	// Verify negative scale preservation for mirrored architectural modules
+	const FTransform MirroredUnaligned(
+		FRotator(0.0f, -88.0f, 0.0f),
+		FVector(-398.0f, 802.0f, 0.0f),
+		FVector(-1.03f, 0.97f, -1.96f));
+
+	const FTransform MirroredSnapped =
+		USLAYCREWEnvironmentKitCatalog::SnapTransformToModularGrid(MirroredUnaligned, BaySpec);
+
+	TestEqual(TEXT("Mirrored Scale.X preserves negative sign (-1.0)"), MirroredSnapped.GetScale3D().X, -1.0);
+	TestEqual(TEXT("Mirrored Scale.Y snaps to +1.0"), MirroredSnapped.GetScale3D().Y, 1.0);
+	TestEqual(TEXT("Mirrored Scale.Z preserves negative sign (-2.0)"), MirroredSnapped.GetScale3D().Z, -2.0);
+	TestTrue(
+		TEXT("Mirrored snapped transform passes HasValidModularScale"),
+		USLAYCREWEnvironmentKitCatalog::HasValidModularScale(MirroredSnapped, BaySpec));
+	TestTrue(
+		TEXT("Mirrored snapped transform passes IsTransformAlignedToGrid"),
+		USLAYCREWEnvironmentKitCatalog::IsTransformAlignedToGrid(MirroredSnapped, BaySpec));
+
+	// Verify degenerate near-zero scale is explicitly rejected by HasValidModularScale and IsTransformAlignedToGrid
+	const FTransform DegenerateZeroScale(
+		FRotator::ZeroRotator,
+		FVector(400.0f, 400.0f, 0.0f),
+		FVector(0.0f, 1.0f, 1.0f));
+	TestFalse(
+		TEXT("Zero scale axis is rejected by HasValidModularScale"),
+		USLAYCREWEnvironmentKitCatalog::HasValidModularScale(DegenerateZeroScale, BaySpec));
+	TestFalse(
+		TEXT("Zero scale axis is rejected by IsTransformAlignedToGrid"),
+		USLAYCREWEnvironmentKitCatalog::IsTransformAlignedToGrid(DegenerateZeroScale, BaySpec));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSLAYCREWEnvironmentKitSafetyTest,
+	"SLAYCREW.Environment.GothicKit.Portable.DependencyAndStagingSafety",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FSLAYCREWEnvironmentKitSafetyTest::RunTest(const FString& Parameters)
+{
+	// 1. Missing source directory must fail (never return a false positive)
+	{
+		const FString NonExistentSourceDir = FPaths::Combine(
+			FPaths::ProjectSavedDir(),
+			TEXT("Temp/NonExistentMedievalVillageSource_DNE/Content"));
+		const TArray<FName> DummyRoots = { FName(TEXT("/Game/Meshes/Candles/SM_Candles_01")) };
+
+		FSLAYCREWPackageDependencyReport MissingSourceReport;
+		const bool bResolved = USLAYCREWEnvironmentKitCatalog::ResolveSourcePackageDependencies(
+			NonExistentSourceDir,
+			DummyRoots,
+			MissingSourceReport);
+
+		TestFalse(TEXT("ResolveSourcePackageDependencies fails when source directory is missing"), bResolved);
+		TestFalse(TEXT("bCompleteDependencyCoverageVerified is false when source is missing"), MissingSourceReport.bCompleteDependencyCoverageVerified);
+		TestFalse(TEXT("FailureReason is populated when source is missing"), MissingSourceReport.FailureReason.IsEmpty());
+
+		FSLAYCREWPackageDependencyReport SandboxMissingSourceReport;
+		const bool bVerified = USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
+			NonExistentSourceDir,
+			DummyRoots,
+			SandboxMissingSourceReport);
+		TestFalse(TEXT("VerifyPrototypeMigrationInScopedSandbox fails when source directory is missing"), bVerified);
+	}
+
+	// 2. Synthetic source directory tests for missing packages, corrupt/unreadable packages, and unsupported paths
+	const FString SyntheticRoot = FPaths::ConvertRelativePathToFull(
+		FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Temp/GothicKitSafetyTest"), FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+	const FString SyntheticSourceContent = FPaths::Combine(SyntheticRoot, TEXT("SourceContent"));
+	const FString SyntheticSandboxContent = FPaths::Combine(SyntheticRoot, TEXT("SandboxContent"));
+
+	ON_SCOPE_EXIT
+	{
+		IFileManager::Get().DeleteDirectory(*SyntheticRoot, /*RequireExists=*/false, /*Tree=*/true);
+	};
+
+	IFileManager::Get().MakeDirectory(*SyntheticSourceContent, /*Tree=*/true);
+
+	// Create a corrupt/unreadable .uasset file (invalid magic header)
+	const FString CorruptAssetFile = FPaths::Combine(SyntheticSourceContent, TEXT("Corrupt/SM_Corrupt.uasset"));
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(CorruptAssetFile), /*Tree=*/true);
+	const TArray<uint8> InvalidBytes = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03 };
+	FFileHelper::SaveArrayToFile(InvalidBytes, *CorruptAssetFile);
+
+	{
+		const TArray<FName> TestRoots = {
+			FName(TEXT("/Game/Missing/SM_DoesNotExist")),
+			FName(TEXT("/Game/Corrupt/SM_Corrupt")),
+			FName(TEXT("/UnmountedExternalPlugin/Meshes/SM_Unsupported"))
+		};
+
+		FSLAYCREWPackageDependencyReport DiagnosticReport;
+		const bool bResolved = USLAYCREWEnvironmentKitCatalog::ResolveSourcePackageDependencies(
+			SyntheticSourceContent,
+			TestRoots,
+			DiagnosticReport);
+
+		TestFalse(TEXT("ResolveSourcePackageDependencies fails on missing/unreadable/unsupported inputs"), bResolved);
+		TestFalse(TEXT("bCompleteDependencyCoverageVerified is false on bad inputs"), DiagnosticReport.bCompleteDependencyCoverageVerified);
+		TestTrue(
+			TEXT("Missing package is recorded in MissingPackages"),
+			DiagnosticReport.MissingPackages.Contains(FName(TEXT("/Game/Missing/SM_DoesNotExist"))));
+		TestTrue(
+			TEXT("Corrupt .uasset is recorded in UnreadablePackages"),
+			DiagnosticReport.UnreadablePackages.Contains(FName(TEXT("/Game/Corrupt/SM_Corrupt"))));
+		TestTrue(
+			TEXT("Unmounted plugin path is recorded in UnsupportedDependencies"),
+			DiagnosticReport.UnsupportedDependencies.Contains(FName(TEXT("/UnmountedExternalPlugin/Meshes/SM_Unsupported"))));
+	}
+
+	// 3. Pre-flight collision detection: copy one valid small .uasset from the active project into SyntheticSourceContent
+	// and verify that staging refuses to overwrite existing game assets or colliding sandbox files.
+	TArray<FString> ExistingProjectAssets;
+	IFileManager::Get().FindFilesRecursive(
+		ExistingProjectAssets,
+		*FPaths::ProjectContentDir(),
+		TEXT("*.uasset"),
+		/*Files=*/true,
+		/*Directories=*/false);
+
+	if (ExistingProjectAssets.Num() > 0)
+	{
+		// Also create a synthetic standalone .uasset copy in SyntheticSourceContent under a non-colliding path,
+		// and pre-populate SyntheticSandboxContent with a sentinel file at the same path to test sandbox collision prevention.
+		const FString SentinelRelative = TEXT("SyntheticCollisionTest/SM_CollisionTest.uasset");
+		const FString SrcCollisionFile = FPaths::Combine(SyntheticSourceContent, SentinelRelative);
+		const FString DstCollisionFile = FPaths::Combine(SyntheticSandboxContent, SentinelRelative);
+
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(SrcCollisionFile), /*Tree=*/true);
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(DstCollisionFile), /*Tree=*/true);
+
+		// Copy a real .uasset header into SrcCollisionFile only if we want LoadPackageRegistryData to parse it,
+		// or test active project collision directly using the source sample if present.
+		const TArray<uint8> SentinelContent = { 0x4B, 0x45, 0x45, 0x50 };
+		FFileHelper::SaveArrayToFile(SentinelContent, *DstCollisionFile);
+
+		// Verify unsafe overlapping source/sandbox directories are rejected
+		FSLAYCREWPackageDependencyReport OverlapReport;
+		const bool bOverlapResult = USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
+			SyntheticSourceContent,
+			{ FName(TEXT("/Game/Corrupt/SM_Corrupt")) },
+			OverlapReport,
+			/*bCleanUpStagedFilesOnExit=*/true,
+			SyntheticSourceContent);
+		TestFalse(TEXT("Overlapping source and sandbox directories are rejected"), bOverlapResult);
+
+		// Verify sentinel file in SyntheticSandboxContent was never overwritten or deleted
+		TArray<uint8> ReadBack;
+		TestTrue(TEXT("Existing destination file preserved untouched"), FFileHelper::LoadFileToArray(ReadBack, *DstCollisionFile));
+		TestEqual(TEXT("Existing destination file content unchanged"), ReadBack.Num(), SentinelContent.Num());
+	}
+
 	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSLAYCREWEnvironmentKitPrototypeMigrationTest,
-	"SLAYCREW.Environment.GothicKit.PrototypeMigrationAndLoad",
+	"SLAYCREW.Environment.GothicKit.Integration.PrototypeMigrationAndLoad",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Parameters)
@@ -88,10 +245,22 @@ bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Param
 	const FString SourceContentDir = TEXT("D:/Unreal Projects/MedievalVillageMegascansS/Content");
 	if (!IFileManager::Get().DirectoryExists(*SourceContentDir))
 	{
-		AddInfo(FString::Printf(
-			TEXT("Source sample Content directory not present at '%s'; skipping local prototype migration verification."),
+		const bool bExplicitlyAllowSkip =
+			Parameters.Contains(TEXT("AllowSkipIfSourceMissing")) ||
+			FPlatformMisc::GetEnvironmentVariable(TEXT("SLAYCREW_SKIP_MISSING_MIGRATION_SOURCE")) == TEXT("1");
+
+		if (bExplicitlyAllowSkip)
+		{
+			AddWarning(FString::Printf(
+				TEXT("SKIPPED (NOT VERIFIED): Source sample Content directory not found at '%s'. Migration integration checks were not executed."),
+				*SourceContentDir));
+			return true;
+		}
+
+		AddError(FString::Printf(
+			TEXT("Source sample Content directory required for integration test was not found at '%s'. Migration verification cannot succeed without source input."),
 			*SourceContentDir));
-		return true;
+		return false;
 	}
 
 	const TArray<FName> RepresentativeRootPackages = {
@@ -101,6 +270,40 @@ bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Param
 		FName(TEXT("/Game/Megascans/3D_Assets/DamagedCastleStairs/SM_DamagedCastleStairs"))
 	};
 
+	// First test pre-flight collision protection using a custom sandbox pre-populated with a colliding file
+	{
+		const FString CollisionSandboxRoot = FPaths::ConvertRelativePathToFull(
+			FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Temp/GothicKitCollisionCheck"), FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+		const FString CollisionSandboxContent = FPaths::Combine(CollisionSandboxRoot, TEXT("Content"));
+		const FString PreExistingFile = FPaths::Combine(CollisionSandboxContent, TEXT("Meshes/Candles/SM_Candles_01.uasset"));
+		ON_SCOPE_EXIT
+		{
+			IFileManager::Get().DeleteDirectory(*CollisionSandboxRoot, /*RequireExists=*/false, /*Tree=*/true);
+		};
+
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(PreExistingFile), /*Tree=*/true);
+		const TArray<uint8> ProtectedBytes = { 0x53, 0x41, 0x46, 0x45 };
+		FFileHelper::SaveArrayToFile(ProtectedBytes, *PreExistingFile);
+
+		FSLAYCREWPackageDependencyReport CollisionReport;
+		const bool bCollisionRun = USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
+			SourceContentDir,
+			{ FName(TEXT("/Game/Meshes/Candles/SM_Candles_01")) },
+			CollisionReport,
+			/*bCleanUpStagedFilesOnExit=*/true,
+			CollisionSandboxContent);
+
+		TestFalse(TEXT("Sandbox staging aborts when a package path collision is detected"), bCollisionRun);
+		TestTrue(
+			TEXT("Colliding package is reported in CollidingPackages"),
+			CollisionReport.CollidingPackages.Contains(FName(TEXT("/Game/Meshes/Candles/SM_Candles_01"))));
+
+		TArray<uint8> PostCollisionBytes;
+		TestTrue(TEXT("Pre-existing colliding file still exists after abort"), FFileHelper::LoadFileToArray(PostCollisionBytes, *PreExistingFile));
+		TestEqual(TEXT("Pre-existing colliding file was not overwritten"), PostCollisionBytes.Num(), ProtectedBytes.Num());
+	}
+
+	// Now execute full isolated sandbox prototype migration verification
 	FSLAYCREWPackageDependencyReport Report;
 	const bool bVerified = USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 		SourceContentDir,
@@ -109,15 +312,26 @@ bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Param
 		/*bCleanUpStagedFilesOnExit=*/true);
 
 	TestTrue(TEXT("All representative Gothic kit packages resolved and loaded in UE 5.8"), bVerified);
+	TestTrue(TEXT("Complete dependency coverage verified"), Report.bCompleteDependencyCoverageVerified);
 	TestEqual(TEXT("Zero missing package dependencies"), Report.MissingPackages.Num(), 0);
+	TestEqual(TEXT("Zero unreadable package dependencies"), Report.UnreadablePackages.Num(), 0);
+	TestEqual(TEXT("Zero unsupported package dependencies"), Report.UnsupportedDependencies.Num(), 0);
+	TestEqual(TEXT("Zero colliding packages"), Report.CollidingPackages.Num(), 0);
 	TestTrue(TEXT("Resolved transitive package closure is non-empty"), Report.TotalFiles >= 30);
 	TestEqual(TEXT("Verified all 4 root assets"), Report.VerifiedAssets.Num(), RepresentativeRootPackages.Num());
 
+	// Verify staging occurred in Saved/Temp/GothicKitSandbox and never in ProjectContentDir
+	const FString ActiveProjectContentDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
+	TestFalse(
+		TEXT("Sandbox directory is outside the active project's Content directory"),
+		FPaths::IsUnderDirectory(Report.SandboxDirectoryUsed, ActiveProjectContentDir));
+
 	AddInfo(FString::Printf(
-		TEXT("Prototype Dependency Closure: %d packages (%lld bytes / %.2f MB)"),
+		TEXT("Prototype Dependency Closure: %d packages (%lld bytes / %.2f MB) staged in '%s'"),
 		Report.TotalFiles,
 		Report.TotalBytes,
-		static_cast<double>(Report.TotalBytes) / (1024.0 * 1024.0)));
+		static_cast<double>(Report.TotalBytes) / (1024.0 * 1024.0),
+		*Report.SandboxDirectoryUsed));
 
 	for (const FSLAYCREWVerifiedAssetLoadInfo& AssetInfo : Report.VerifiedAssets)
 	{
@@ -137,13 +351,17 @@ bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Param
 			*AssetInfo.ResolvedMaterialOrParentName.ToString()));
 	}
 
-	// Verify staged binary files were cleaned up so the Git worktree stays clean
-	const FString StagedCandleCheck = FPaths::Combine(
+	// Verify both the isolated sandbox directory and the active project Content directory have no leftover staged files
+	TestFalse(
+		TEXT("Isolated sandbox directory cleaned up after verification"),
+		IFileManager::Get().DirectoryExists(*Report.SandboxDirectoryUsed));
+
+	const FString ProjectContentCandleCheck = FPaths::Combine(
 		FPaths::ProjectContentDir(),
 		TEXT("Meshes/Candles/SM_Candles_01.uasset"));
 	TestFalse(
-		TEXT("Temporary staged .uasset files cleaned up after verification"),
-		IFileManager::Get().FileExists(*StagedCandleCheck));
+		TEXT("Active project Content directory remained untouched"),
+		IFileManager::Get().FileExists(*ProjectContentCandleCheck));
 
 	return true;
 }

@@ -167,19 +167,47 @@ struct SLAYCREW_API FSLAYCREWPackageDependencyReport
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
 	TArray<FName> RootPackages;
 
-	/** Complete transitive closure of /Game/... packages discovered via IAssetRegistry::LoadPackageRegistryData. */
+	/** Complete transitive closure of /Game/... packages verified via IAssetRegistry::LoadPackageRegistryData. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
 	TArray<FName> ResolvedDependencyPackages;
 
-	/** Any /Game/... package dependencies that could not be found in the source Content directory. */
+	/** Built-in /Engine/... and /Script/... dependencies referenced by the package closure. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	TArray<FName> EngineAndScriptDependencies;
+
+	/** Any /Game/... or /Engine/... package dependencies that could not be found on disk. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
 	TArray<FName> MissingPackages;
 
-	/** Total number of .uasset files in the resolved dependency closure. */
+	/** Packages that exist on disk but failed binary header or AssetRegistry metadata reading. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	TArray<FName> UnreadablePackages;
+
+	/** Unsupported non-/Game/ or unmounted plugin/script dependencies that prevent self-contained migration. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	TArray<FName> UnsupportedDependencies;
+
+	/** Packages that collided with existing project assets during pre-flight staging validation. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	TArray<FName> CollidingPackages;
+
+	/** True only when all root packages and transitive dependencies were readable, supported, and verified present. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	bool bCompleteDependencyCoverageVerified = false;
+
+	/** Sandbox directory used during isolated prototype verification. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	FString SandboxDirectoryUsed;
+
+	/** Human-readable diagnostic summary when dependency resolution or sandbox staging fails. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	FString FailureReason;
+
+	/** Total number of readable .uasset files in the resolved /Game/... dependency closure. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
 	int32 TotalFiles = 0;
 
-	/** Total size in bytes of all .uasset files in the resolved dependency closure. */
+	/** Total size in bytes of all readable .uasset files in the resolved /Game/... dependency closure. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
 	int64 TotalBytes = 0;
 
