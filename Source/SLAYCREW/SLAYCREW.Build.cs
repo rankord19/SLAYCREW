@@ -21,10 +21,13 @@ public class SLAYCREW : ModuleRules
 			"Slate"
 		});
 
-		PrivateDependencyModuleNames.AddRange(new string[] { });
+		PrivateDependencyModuleNames.AddRange(new string[] {
+			"AssetRegistry"
+		});
 
 		PublicIncludePaths.AddRange(new string[] {
 			"SLAYCREW",
+			"SLAYCREW/Environment",
 			"SLAYCREW/Variant_Platforming",
 			"SLAYCREW/Variant_Platforming/Animation",
 			"SLAYCREW/Variant_Combat",
