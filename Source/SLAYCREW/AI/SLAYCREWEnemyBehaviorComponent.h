@@ -10,7 +10,7 @@
 /**
  * Modular, authority-aware enemy behavior state machine component.
  * Manages transitions between Idle, Patrol, Chase, and AttackIntent states
- * without depending on health, damage, or full combat systems.
+ * without tightly coupling to concrete character, health, or damage classes.
  */
 UCLASS(ClassGroup = (SLAYCREW), meta = (BlueprintSpawnableComponent))
 class SLAYCREW_API USLAYCREWEnemyBehaviorComponent : public UActorComponent
@@ -54,7 +54,23 @@ public:
 	UFUNCTION(BlueprintPure, Category = "SLAYCREW|AI")
 	float GetTimeInCurrentState() const { return TimeInCurrentState; }
 
-	/** Assigns the target actor to pursue/engage (authority only when owned by an actor). */
+	/**
+	 * Evaluates whether CandidateTarget is valid, alive, conscious (not incapacitated), and combat-capable.
+	 * Checks CustomTargetEligibilityPredicate, ISLAYCREWCombatTargetInterface, disqualifying tags
+	 * ("Dead", "Incapacitated", "Downed", "Untargetable"), and reflection hooks on the actor and its components
+	 * (IsDead, IsIncapacitated, IsDepleted, IsAlive, CanAct, CanPerformActions, GetCurrentHealth).
+	 */
+	UFUNCTION(BlueprintPure, Category = "SLAYCREW|AI")
+	bool IsTargetEligible(const AActor* CandidateTarget) const;
+
+	/** Returns true if CurrentTarget is assigned and currently passes IsTargetEligible(). */
+	UFUNCTION(BlueprintPure, Category = "SLAYCREW|AI")
+	bool HasValidCombatTarget() const;
+
+	/**
+	 * Assigns the target actor to pursue/engage (authority only when owned by an actor).
+	 * If NewTarget is not combat-eligible (e.g. dead or incapacitated), CurrentTarget is cleared.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "SLAYCREW|AI")
 	void SetTargetActor(AActor* NewTarget);
 
@@ -90,7 +106,7 @@ public:
 	UFUNCTION(BlueprintPure, Category = "SLAYCREW|AI")
 	bool HasActivePatrolWaypoints() const;
 
-	/** Triggers placeholder attack intent logic and broadcasts OnAttackIntent. */
+	/** Triggers placeholder attack intent logic and broadcasts OnAttackIntent if HasValidCombatTarget() is true. */
 	UFUNCTION(BlueprintCallable, Category = "SLAYCREW|AI")
 	void TriggerAttackIntent();
 
@@ -103,9 +119,16 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SLAYCREW|AI")
 	TArray<FVector> PatrolWaypoints;
 
+	/** Optional C++ delegate to override or extend target eligibility rules. */
+	FSLAYCREWTargetEligibilityPredicate CustomTargetEligibilityPredicate;
+
 	/** Broadcast whenever the behavior state changes. */
 	UPROPERTY(BlueprintAssignable, Category = "SLAYCREW|AI|Events")
 	FOnSLAYCREWEnemyBehaviorStateChanged OnBehaviorStateChanged;
+
+	/** Broadcast whenever the active patrol waypoint index or destination changes. */
+	UPROPERTY(BlueprintAssignable, Category = "SLAYCREW|AI|Events")
+	FOnSLAYCREWEnemyPatrolWaypointChanged OnPatrolWaypointChanged;
 
 	/** Broadcast when placeholder attack intent is triggered in the AttackIntent state. */
 	UPROPERTY(BlueprintAssignable, Category = "SLAYCREW|AI|Events")

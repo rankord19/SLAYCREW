@@ -3,13 +3,48 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "UObject/Interface.h"
 #include "SLAYCREWEnemyBehaviorTypes.generated.h"
 
 class AActor;
 
 /**
+ * Reusable interface for actors or components that can report whether they are currently
+ * combat-capable and eligible to be targeted by enemy AI (e.g., not dead and not incapacitated).
+ *
+ * Integration points supported by USLAYCREWEnemyBehaviorComponent::IsTargetEligible:
+ * 1. Implementing ISLAYCREWCombatTargetInterface on the target Actor or any of its ActorComponents.
+ * 2. Binding USLAYCREWEnemyBehaviorComponent::CustomTargetEligibilityPredicate.
+ * 3. Zero-argument UFUNCTIONs on the target Actor or its components (e.g. USlayHealthComponent / USlayInjuryComponent):
+ *    IsDead(), IsIncapacitated(), IsDepleted(), IsAlive(), CanAct(), CanPerformActions(), GetCurrentHealth().
+ * 4. Actor or Component tags: "Dead", "Incapacitated", "Downed", "Untargetable".
+ */
+UINTERFACE(MinimalAPI, Blueprintable)
+class USLAYCREWCombatTargetInterface : public UInterface
+{
+	GENERATED_BODY()
+};
+
+class SLAYCREW_API ISLAYCREWCombatTargetInterface
+{
+	GENERATED_BODY()
+
+public:
+	/**
+	 * Returns true if this actor/component is alive, conscious, and capable of combat.
+	 * Protagonists at 0 HP (dead) and companions at 0 HP (incapacitated) should return false.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SLAYCREW|AI")
+	bool IsTargetCombatCapable() const;
+	virtual bool IsTargetCombatCapable_Implementation() const { return true; }
+};
+
+/** Optional C++ predicate for custom target-eligibility overrides. */
+DECLARE_DELEGATE_RetVal_OneParam(bool, FSLAYCREWTargetEligibilityPredicate, const AActor* /*CandidateTarget*/);
+
+/**
  * High-level behavior states for SLAYCREW enemy AI.
- * Kept intentionally decoupled from health, damage, and combat execution systems.
+ * Kept intentionally decoupled from concrete character, health, and combat classes.
  */
 UENUM(BlueprintType)
 enum class ESLAYCREWEnemyBehaviorState : uint8
@@ -77,6 +112,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
 	FOnSLAYCREWEnemyBehaviorStateChanged,
 	ESLAYCREWEnemyBehaviorState, PreviousState,
 	ESLAYCREWEnemyBehaviorState, NewState);
+
+/** Broadcast when the active patrol waypoint index or destination changes. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+	FOnSLAYCREWEnemyPatrolWaypointChanged,
+	int32, NewWaypointIndex,
+	FVector, NewWaypointLocation);
 
 /** Broadcast when the enemy signals placeholder attack intent against its current target. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(

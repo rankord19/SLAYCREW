@@ -3,7 +3,144 @@
 #include "AI/SLAYCREWEnemyBehaviorComponent.h"
 #include "GameFramework/Actor.h"
 #include "Net/UnrealNetwork.h"
+#include "UObject/UnrealType.h"
 #include "SLAYCREW.h"
+
+namespace
+{
+	bool TryCallZeroArgBoolFunction(const UObject* Object, FName FunctionName, bool& OutValue)
+	{
+		if (!IsValid(Object))
+		{
+			return false;
+		}
+
+		UFunction* Func = Object->FindFunction(FunctionName);
+		if (!Func || Func->NumParms != 1)
+		{
+			return false;
+		}
+
+		const FBoolProperty* ReturnProp = CastField<FBoolProperty>(Func->GetReturnProperty());
+		if (!ReturnProp)
+		{
+			return false;
+		}
+
+		TArray<uint8, TInlineAllocator<16>> ParmsBuffer;
+		ParmsBuffer.AddZeroed(Func->ParmsSize);
+		const_cast<UObject*>(Object)->ProcessEvent(Func, ParmsBuffer.GetData());
+		OutValue = ReturnProp->GetPropertyValue_InContainer(ParmsBuffer.GetData());
+		return true;
+	}
+
+	bool TryCallZeroArgFloatFunction(const UObject* Object, FName FunctionName, float& OutValue)
+	{
+		if (!IsValid(Object))
+		{
+			return false;
+		}
+
+		UFunction* Func = Object->FindFunction(FunctionName);
+		if (!Func || Func->NumParms != 1)
+		{
+			return false;
+		}
+
+		const FProperty* ReturnProp = Func->GetReturnProperty();
+		const FFloatProperty* FloatProp = CastField<FFloatProperty>(ReturnProp);
+		const FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(ReturnProp);
+		if (!FloatProp && !DoubleProp)
+		{
+			return false;
+		}
+
+		TArray<uint8, TInlineAllocator<16>> ParmsBuffer;
+		ParmsBuffer.AddZeroed(Func->ParmsSize);
+		const_cast<UObject*>(Object)->ProcessEvent(Func, ParmsBuffer.GetData());
+		if (FloatProp)
+		{
+			OutValue = FloatProp->GetPropertyValue_InContainer(ParmsBuffer.GetData());
+		}
+		else
+		{
+			OutValue = static_cast<float>(DoubleProp->GetPropertyValue_InContainer(ParmsBuffer.GetData()));
+		}
+		return true;
+	}
+
+	bool IsObjectCombatCapableByReflection(const UObject* Object)
+	{
+		if (!IsValid(Object))
+		{
+			return false;
+		}
+
+		if (Object->GetClass()->ImplementsInterface(USLAYCREWCombatTargetInterface::StaticClass()))
+		{
+			if (!ISLAYCREWCombatTargetInterface::Execute_IsTargetCombatCapable(Object))
+			{
+				return false;
+			}
+		}
+
+		bool bFlag = false;
+		// Disqualifying true flags (e.g., USlayHealthComponent::IsDead, USlayHealthComponent::IsDepleted, IsIncapacitated)
+		static const FName DisqualifyingTrueFuncs[] = {
+			FName(TEXT("IsDead")),
+			FName(TEXT("IsIncapacitated")),
+			FName(TEXT("IsDepleted"))
+		};
+		for (const FName& FuncName : DisqualifyingTrueFuncs)
+		{
+			if (TryCallZeroArgBoolFunction(Object, FuncName, bFlag) && bFlag)
+			{
+				return false;
+			}
+		}
+
+		// Required true capability flags when present (e.g., USlayInjuryComponent::CanAct, ASlayFighterCharacter::CanPerformActions)
+		static const FName RequiredTrueFuncs[] = {
+			FName(TEXT("IsAlive")),
+			FName(TEXT("CanAct")),
+			FName(TEXT("CanPerformActions")),
+			FName(TEXT("CanBeTargeted"))
+		};
+		for (const FName& FuncName : RequiredTrueFuncs)
+		{
+			if (TryCallZeroArgBoolFunction(Object, FuncName, bFlag) && !bFlag)
+			{
+				return false;
+			}
+		}
+
+		float CurrentHealth = 1.0f;
+		if (TryCallZeroArgFloatFunction(Object, FName(TEXT("GetCurrentHealth")), CurrentHealth) && CurrentHealth <= 0.0f)
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	bool HasDisqualifyingTags(const TArray<FName>& Tags)
+	{
+		static const FName DisqualifyingTags[] = {
+			FName(TEXT("Dead")),
+			FName(TEXT("Incapacitated")),
+			FName(TEXT("Downed")),
+			FName(TEXT("Untargetable"))
+		};
+		for (const FName& DisqualifyingTag : DisqualifyingTags)
+		{
+			if (Tags.Contains(DisqualifyingTag))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+}
 
 USLAYCREWEnemyBehaviorComponent::USLAYCREWEnemyBehaviorComponent()
 {
@@ -43,6 +180,63 @@ void USLAYCREWEnemyBehaviorComponent::GetLifetimeReplicatedProps(TArray<FLifetim
 	DOREPLIFETIME(USLAYCREWEnemyBehaviorComponent, CurrentTarget);
 }
 
+bool USLAYCREWEnemyBehaviorComponent::IsTargetEligible(const AActor* CandidateTarget) const
+{
+	if (!IsValid(CandidateTarget) || CandidateTarget->IsActorBeingDestroyed() || CandidateTarget->GetTearOff())
+	{
+		return false;
+	}
+
+	if (CandidateTarget == GetOwner())
+	{
+		return false;
+	}
+
+	if (CustomTargetEligibilityPredicate.IsBound())
+	{
+		if (!CustomTargetEligibilityPredicate.Execute(CandidateTarget))
+		{
+			return false;
+		}
+	}
+
+	if (HasDisqualifyingTags(CandidateTarget->Tags))
+	{
+		return false;
+	}
+
+	if (!IsObjectCombatCapableByReflection(CandidateTarget))
+	{
+		return false;
+	}
+
+	TInlineComponentArray<const UActorComponent*> Components(CandidateTarget);
+	for (const UActorComponent* Comp : Components)
+	{
+		if (!IsValid(Comp))
+		{
+			continue;
+		}
+
+		if (HasDisqualifyingTags(Comp->ComponentTags))
+		{
+			return false;
+		}
+
+		if (!IsObjectCombatCapableByReflection(Comp))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool USLAYCREWEnemyBehaviorComponent::HasValidCombatTarget() const
+{
+	return IsTargetEligible(CurrentTarget);
+}
+
 void USLAYCREWEnemyBehaviorComponent::EvaluateBehavior(float DeltaTime)
 {
 	if (!HasBehaviorAuthority() || DeltaTime < 0.0f)
@@ -52,10 +246,16 @@ void USLAYCREWEnemyBehaviorComponent::EvaluateBehavior(float DeltaTime)
 
 	TimeInCurrentState += DeltaTime;
 
+	// Immediately clear CurrentTarget if it died, became incapacitated, or otherwise lost combat eligibility
+	if (CurrentTarget != nullptr && !IsTargetEligible(CurrentTarget))
+	{
+		ClearTargetActor();
+	}
+
 	const AActor* OwnerActor = GetOwner();
 	const FVector OwnerLocation = OwnerActor ? OwnerActor->GetActorLocation() : FVector::ZeroVector;
 
-	const bool bHasValidTarget = IsValid(CurrentTarget);
+	const bool bHasValidTarget = HasValidCombatTarget();
 	float DistanceToTarget = TNumericLimits<float>::Max();
 	if (bHasValidTarget)
 	{
@@ -70,7 +270,7 @@ void USLAYCREWEnemyBehaviorComponent::EvaluateBehavior(float DeltaTime)
 		ClearTargetActor();
 	}
 
-	const bool bStillHasValidTarget = IsValid(CurrentTarget);
+	const bool bStillHasValidTarget = HasValidCombatTarget();
 	const bool bHasPatrolPoints = HasActivePatrolWaypoints();
 
 	const ESLAYCREWEnemyBehaviorState DesiredState = DetermineDesiredState(
@@ -95,8 +295,12 @@ void USLAYCREWEnemyBehaviorComponent::EvaluateBehavior(float DeltaTime)
 			const float DistanceToWaypoint = FVector::Dist(OwnerLocation, TargetWaypoint);
 			if (DistanceToWaypoint <= BehaviorConfig.PatrolAcceptanceRadius)
 			{
-				const bool bHasNextWaypoint = AdvancePatrolWaypoint();
-				if (!bHasNextWaypoint || BehaviorConfig.bPauseAtPatrolWaypoints)
+				if (BehaviorConfig.bPauseAtPatrolWaypoints)
+				{
+					SetBehaviorState(ESLAYCREWEnemyBehaviorState::Idle);
+					AdvancePatrolWaypoint();
+				}
+				else if (!AdvancePatrolWaypoint())
 				{
 					SetBehaviorState(ESLAYCREWEnemyBehaviorState::Idle);
 				}
@@ -206,6 +410,12 @@ void USLAYCREWEnemyBehaviorComponent::SetTargetActor(AActor* NewTarget)
 		return;
 	}
 
+	if (NewTarget != nullptr && !IsTargetEligible(NewTarget))
+	{
+		CurrentTarget = nullptr;
+		return;
+	}
+
 	CurrentTarget = NewTarget;
 }
 
@@ -223,6 +433,10 @@ void USLAYCREWEnemyBehaviorComponent::SetPatrolWaypoints(const TArray<FVector>& 
 {
 	PatrolWaypoints = InWaypoints;
 	CurrentPatrolIndex = (PatrolWaypoints.Num() > 0) ? 0 : INDEX_NONE;
+	if (PatrolWaypoints.IsValidIndex(CurrentPatrolIndex))
+	{
+		OnPatrolWaypointChanged.Broadcast(CurrentPatrolIndex, PatrolWaypoints[CurrentPatrolIndex]);
+	}
 }
 
 void USLAYCREWEnemyBehaviorComponent::AddPatrolWaypoint(const FVector& Waypoint)
@@ -231,6 +445,7 @@ void USLAYCREWEnemyBehaviorComponent::AddPatrolWaypoint(const FVector& Waypoint)
 	if (CurrentPatrolIndex == INDEX_NONE)
 	{
 		CurrentPatrolIndex = 0;
+		OnPatrolWaypointChanged.Broadcast(CurrentPatrolIndex, PatrolWaypoints[CurrentPatrolIndex]);
 	}
 }
 
@@ -256,12 +471,14 @@ bool USLAYCREWEnemyBehaviorComponent::AdvancePatrolWaypoint()
 	if (PatrolWaypoints.IsValidIndex(NextIndex))
 	{
 		CurrentPatrolIndex = NextIndex;
+		OnPatrolWaypointChanged.Broadcast(CurrentPatrolIndex, PatrolWaypoints[CurrentPatrolIndex]);
 		return true;
 	}
 
 	if (BehaviorConfig.bLoopPatrol)
 	{
 		CurrentPatrolIndex = 0;
+		OnPatrolWaypointChanged.Broadcast(CurrentPatrolIndex, PatrolWaypoints[CurrentPatrolIndex]);
 		return true;
 	}
 
@@ -276,7 +493,7 @@ bool USLAYCREWEnemyBehaviorComponent::HasActivePatrolWaypoints() const
 
 void USLAYCREWEnemyBehaviorComponent::TriggerAttackIntent()
 {
-	if (!HasBehaviorAuthority())
+	if (!HasBehaviorAuthority() || !HasValidCombatTarget())
 	{
 		return;
 	}
