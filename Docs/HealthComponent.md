@@ -4,8 +4,8 @@ Add `USlayHealthComponent` (`Components/SlayHealthComponent.h`) as a default
 subobject or Blueprint component on an actor. No existing actors are changed.
 Configure MaxHealth in defaults; authority starts at full health in BeginPlay.
 Non-finite capacity falls back to 100; finite capacity is clamped to at least 1.
-Current health stays between zero and capacity. Runtime capacity changes and
-revival are intentionally not provided.
+Current health stays between zero and capacity. Runtime capacity changes are
+not provided. Companion-only incapacitation recovery is described below.
 
 Call ApplyDamage or Heal on authority after BeginPlay; each returns the actual
 amount removed/restored. Non-positive and non-finite inputs are ignored. Healing
@@ -15,9 +15,21 @@ its TakeDamage override preserves the engine event. Use one damage path per hit
 and one health component per actor to avoid duplicate application.
 
 OnHealthChanged reports previous/new health; OnDeath fires on a positive-to-zero
-transition. Death does not destroy the actor, disable movement, or play animation.
+transition for mortal actors. The health component itself does not destroy the
+actor, disable movement, or play animation.
 Bind presentation/gameplay as needed; query getters when initially binding UI.
 Before BeginPlay / initial replication, getters may expose constructor defaults.
+
+## Companion policy
+
+`bIncapacitateAtZero` defaults to false, preserving the original mortal contract.
+Companions configure it true in defaults: at zero `IsDepleted()` is true while
+`IsDead()` is false, and OnDeath does not fire. Ordinary healing still cannot
+recover them unless `bAllowHealingRecovery` is explicitly enabled. Authority may
+call `RecoverFromIncapacitation(HealthFraction)` for explicit recovery at zero;
+this never revives mortal actors. See [Combat and injury](CombatAndInjury.md) for
+the fighter, companion and presentation integration. Check depletion rather than
+death when deciding whether any character can perform actions.
 
 ## Networking assumptions
 
@@ -34,7 +46,7 @@ Before BeginPlay / initial replication, getters may expose constructor defaults.
   Authoritative death consequences belong on the server, not in client callbacks.
 - Owner relevancy, dormancy and update frequency still govern delivery. Code that
   modifies a dormant actor must wake/flush it as appropriate. No prediction,
-  resurrection, team rules, damage attribution, or combat framework is included.
+  mortal resurrection, team rules, damage attribution, or combat framework is included.
 - Maximum and current health are separate replicated properties; callbacks should
   not assume cross-property notification order when initializing UI.
 

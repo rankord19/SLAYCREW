@@ -52,7 +52,7 @@ protected:
 public:
 
 	/** Constructor */
-	ASLAYCREWCharacter();	
+	ASLAYCREWCharacter(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
 protected:
 

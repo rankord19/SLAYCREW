@@ -24,13 +24,27 @@ public:
 	float GetCurrentHealth() const { return CurrentHealth; }
 
 	UFUNCTION(BlueprintPure, Category="Health")
-	bool IsDead() const { return CurrentHealth <= 0.0f; }
+	bool IsDead() const { return IsDepleted() && !bIncapacitateAtZero; }
+
+	UFUNCTION(BlueprintPure, Category="Health")
+	bool IsDepleted() const { return CurrentHealth <= 0.0f; }
+
+	/** Companion policy. Configure in defaults, never change during play. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category="Health")
+	bool bIncapacitateAtZero = false;
+
+	UPROPERTY(EditDefaultsOnly, Category="Health")
+	bool bAllowHealingRecovery = false;
+
+	/** Explicit authority-only recovery; never revives a mortal actor. */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="Health")
+	bool RecoverFromIncapacitation(float HealthFraction);
 
 	/** Returns actual health removed. Invalid amounts and non-authority calls do nothing. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="Health")
 	float ApplyDamage(float Amount);
 
-	/** Returns actual health restored. Dead actors cannot be healed. */
+	/** Ordinary healing cannot recover incapacitated companions unless explicitly enabled. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="Health")
 	float Heal(float Amount);
 
