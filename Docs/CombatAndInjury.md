@@ -4,8 +4,7 @@
 
 Implemented on `codex/astra-combat-injury`, a fresh branch containing PR #1's
 health commit `788d831`. Main was `d7c51d2` when fetched on 2026-11-07.
-PRs #1, #3 and #4 were open and unmerged. This PR targets main and therefore
-includes #1 until it is merged. No main merge, Opus/Argon edits, maps or binary
+PRs #1, #3 and #4 were open and unmerged. PR #5 targets `agent/astra-core`, stacked on #1. After #1 is merged with approval, retarget #5 to main. Neither PR is merged or retargeted by these fixes. No main merge, Opus/Argon edits, maps or binary
 assets are part of this work. PR #3 is an optional content integration, not a
 compile dependency. PR #4 is unrelated.
 
@@ -51,9 +50,7 @@ the active window but retains its original cooldown; zero HP cancels immediately
 Wounded attack speed divides both active and recovery durations when an attack
 starts. Changes during an attack affect the next attack; incapacitation always
 cancels. OnAttackStateChanged supports placeholder animation/audio. Override
-CanHitTarget for future team/PvP rules or weapon filters. Default behavior permits
-any other damageable actor with health, including companions: no faction design
-is assumed. Future armor mitigation belongs in the single damage path.
+CanHitTarget for future team/PvP rules or weapon filters. Default behavior rejects allies and depleted targets. Matching non-None CombatGroup names identify allies. Fighters and companions default to Party; hostile content must use a different group. bAllowFriendlyFire and bAllowDepletedTargets are explicit opt-ins. IsFriendlyTarget remains overridable for future faction rules; CanHitTarget can supply a full eligibility override (call parent to retain default checks). Eligibility never changes health recovery rules. Future armor mitigation belongs in the single damage path.
 
 This is a short forward volume, not a weapon-socket or animation-notify system.
 It does not sweep the space traveled between ticks, provide lag compensation,
@@ -88,7 +85,7 @@ at the 50% boundary and approach configurable minima near zero. Default minimum
 movement/attack/dodge multipliers are 0.4 / 0.5 / 0.25. At zero, all are zero.
 The movement component multiplies Super::GetMaxSpeed without overwriting base
 stats. Healing above half restores full performance. Movement stops immediately
-on depletion; the movement tick discards input/forces while depleted.
+on depletion; the movement component clears input/forces and selects MOVE_None while depleted. TickComponent, PerformMovement (including server client-move processing), and SimulateMovement continue through their Super implementations. Recovery restores the saved movement/custom mode only if the health lock still owns MOVE_None; a preexisting MOVE_None stays disabled. External movement-mode changes during incapacitation must be coordinated with this lock.
 
 OnInjuryChanged fires for every HP change, including within Wounded; bind wounded
 locomotion, hit reaction, breathing, audio and animation changes here.
@@ -182,3 +179,49 @@ Modified files:
 - Source/SLAYCREW/Components/SlayHealthComponent.h and .cpp
 - Source/SLAYCREW/SLAYCREWCharacter.h and .cpp (constructor forwarding only)
 - Docs/HealthComponent.md
+
+## Blueprint integration checklist (PR #5 review update)
+
+1. In the player Blueprint, use Class Settings -> Parent Class -> SlayFighterCharacter.
+   Compile and confirm inherited Health, Melee, Injury and SlayCharacterMovementComponent;
+   remove any duplicate HP component or legacy Variant_Combat HP logic.
+2. Reparent each of the four companion Blueprints to SlayCompanionCharacter. Verify
+   Health.bIncapacitateAtZero is true and bAllowHealingRecovery remains false unless
+   explicitly desired. Preserve existing meshes, animation classes and input assignments.
+3. In each character's Melee defaults, assign the same CombatGroup (default Party)
+   to allies. Assign a different group to enemies with melee components. A target
+   without melee/group metadata is unaffiliated. Enable bAllowFriendlyFire on each
+   attacker that may hurt allies; this is directional, so configure both sides if wanted.
+   Keep bAllowDepletedTargets false unless an explicit targeting rule needs it.
+4. Retain the existing controller mapping contexts. Assign BasicAttackAction if
+   already mapped, otherwise use the transient LMB/right-shoulder fallback. Confirm
+   the GameMode uses the reparented player Blueprint as Default Pawn Class.
+5. Bind OnProtagonistDeath/ReceiveProtagonistDeath to presentation and locally owned
+   Game Over UI; bind OnInjuryChanged and OnIncapacitated for companion presentation.
+   Dodge/ability logic must consult CanPerformActions and the injury multipliers.
+6. Configure query collision on targets and Visibility-blocking walls. Run a PIE
+   check for ally rejection, hostile damage, collapse and explicit recovery. No
+   Blueprint/map changes or visual PIE checks are included in this source-only PR.
+
+Additional tests: SLAYCREW.Combat.TargetEligibility and
+SLAYCREW.Combat.MovementLockAndRecovery. Policy properties are class defaults, not
+runtime replicated faction state. Configure matching defaults on peers; authority
+makes the final eligibility decision. Two-client/dedicated-server movement,
+root-motion, moving-base, correction and packet-loss behavior remain unverified.
+
+## PR #5 review-fix verification
+
+UE 5.8.4 SLAYCREWEditor Win64 Development build succeeded (exit 0), using
+-MaxParallelActions=1. The first build exposed a missing policy method definition;
+that implementation was completed before the successful rebuild. MSVC 14.52.37025
+still emits the engine's newer-than-preferred toolchain warning.
+
+UnrealEditor-Cmd with NullRHI, Automation RunTests SLAYCREW.: six tests passed,
+zero failed, zero test warnings, zero not-run; process exit 0. Report verified at
+Saved/Automation/ReviewFixes/index.json; log at Saved/Logs/ReviewFixes.log.
+The original four tests and the two new tests listed above all passed.
+`git diff --check` passed. No multiplayer or visual/hardware-input testing was
+performed. No maps, assets, health architecture or Opus/Argon files changed.
+
+Review-fix files: SlayMeleeComponent.h/.cpp, SlayFighterCharacter.cpp,
+SlayCharacterMovementComponent.h/.cpp, Tests/SlayCombatTests.cpp and this document.

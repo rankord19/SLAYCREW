@@ -11,4 +11,11 @@ class SLAYCREW_API USlayCharacterMovementComponent : public UCharacterMovementCo
 public:
  virtual float GetMaxSpeed() const override;
  virtual void TickComponent(float Delta, ELevelTick TickType, FActorComponentTickFunction* Function) override;
+ virtual void PerformMovement(float DeltaSeconds) override;
+ virtual void SimulateMovement(float DeltaSeconds) override;
+private:
+ void UpdateHealthMovementLock();
+ bool bHealthMovementLocked = false;
+ EMovementMode SavedMovementMode = MOVE_Walking;
+ uint8 SavedCustomMode = 0;
 };

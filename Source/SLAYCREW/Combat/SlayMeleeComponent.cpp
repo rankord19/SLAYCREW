@@ -75,8 +75,15 @@ void USlayMeleeComponent::TickComponent(float Delta, ELevelTick TickType, FActor
 }
 bool USlayMeleeComponent::CanHitTarget_Implementation(AActor* Target) const
 {
- return IsValid(Target) && Target != GetOwner() && Target->CanBeDamaged()
-  && Target->FindComponentByClass<USlayHealthComponent>() != nullptr;
+ if (!IsValid(Target) || Target == GetOwner() || !Target->CanBeDamaged()) { return false; }
+ const USlayHealthComponent* TargetHealth = Target->FindComponentByClass<USlayHealthComponent>();
+ return TargetHealth && (!TargetHealth->IsDepleted() || bAllowDepletedTargets)
+  && (bAllowFriendlyFire || !IsFriendlyTarget(Target));
+}
+bool USlayMeleeComponent::IsFriendlyTarget_Implementation(AActor* Target) const
+{
+ const USlayMeleeComponent* Other = IsValid(Target) ? Target->FindComponentByClass<USlayMeleeComponent>() : nullptr;
+ return Other && !CombatGroup.IsNone() && CombatGroup == Other->CombatGroup;
 }
 void USlayMeleeComponent::Sweep()
 {

@@ -17,6 +17,7 @@ ASlayFighterCharacter::ASlayFighterCharacter(const FObjectInitializer& ObjectIni
  bReplicates = true;
  Health = CreateDefaultSubobject<USlayHealthComponent>(TEXT("Health"));
  Melee = CreateDefaultSubobject<USlayMeleeComponent>(TEXT("Melee"));
+ Melee->CombatGroup = TEXT("Party");
  Injury = CreateDefaultSubobject<USlayInjuryComponent>(TEXT("Injury"));
 }
 ASlayCompanionCharacter::ASlayCompanionCharacter(const FObjectInitializer& ObjectInitializer) : Super(ObjectInitializer)

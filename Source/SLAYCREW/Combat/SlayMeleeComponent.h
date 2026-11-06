@@ -21,6 +21,12 @@ public:
  UFUNCTION(BlueprintCallable, Category="Combat") void CancelAttack();
  UFUNCTION(BlueprintPure, Category="Combat") bool CanAttack() const;
  UFUNCTION(BlueprintPure, Category="Combat") ESlayAttackState GetAttackState() const { return State; }
+ /** Matching non-None groups are allies. None is unaffiliated. Configure identical defaults on peers. */
+ UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Combat|Eligibility") FName CombatGroup = NAME_None;
+ UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Combat|Eligibility") bool bAllowFriendlyFire = false;
+ /** Eligibility only; does not change depleted health's damage/recovery rules. */
+ UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Combat|Eligibility") bool bAllowDepletedTargets = false;
+ UFUNCTION(BlueprintNativeEvent, Category="Combat|Eligibility") bool IsFriendlyTarget(AActor* Target) const;
  /** Override for teams, PvP rules or weapon-specific target filters. Runs on authority. */
  UFUNCTION(BlueprintNativeEvent, Category="Combat") bool CanHitTarget(AActor* Target) const;
  UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="0")) float Damage = 25.f;

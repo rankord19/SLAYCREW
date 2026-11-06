@@ -13,15 +13,42 @@ float USlayCharacterMovementComponent::GetMaxSpeed() const
  }
  return Super::GetMaxSpeed();
 }
-void USlayCharacterMovementComponent::TickComponent(float Delta, ELevelTick TickType, FActorComponentTickFunction* Function)
+void USlayCharacterMovementComponent::UpdateHealthMovementLock()
 {
  const USlayHealthComponent* Health = CharacterOwner ? CharacterOwner->FindComponentByClass<USlayHealthComponent>() : nullptr;
  if (Health && Health->IsDepleted())
  {
+  if (!bHealthMovementLocked)
+  {
+   SavedMovementMode = MovementMode;
+   SavedCustomMode = CustomMovementMode;
+   bHealthMovementLocked = true;
+  }
   StopMovementImmediately();
   CharacterOwner->ConsumeMovementInputVector();
   ClearAccumulatedForces();
-  return;
+  DisableMovement();
  }
+ else if (bHealthMovementLocked)
+ {
+  bHealthMovementLocked = false;
+  // Only undo the movement mode owned by this lock. Preserve explicit external modes.
+  if (MovementMode == MOVE_None) { SetMovementMode(SavedMovementMode, SavedCustomMode); }
+ }
+}
+void USlayCharacterMovementComponent::TickComponent(float Delta, ELevelTick TickType, FActorComponentTickFunction* Function)
+{
+ UpdateHealthMovementLock();
+ // MOVE_None lets the engine process bookkeeping, networking and root-motion cleanup.
  Super::TickComponent(Delta, TickType, Function);
+}
+void USlayCharacterMovementComponent::PerformMovement(float DeltaSeconds)
+{
+ UpdateHealthMovementLock(); // Also covers authority processing of client moves outside TickComponent.
+ Super::PerformMovement(DeltaSeconds);
+}
+void USlayCharacterMovementComponent::SimulateMovement(float DeltaSeconds)
+{
+ UpdateHealthMovementLock();
+ Super::SimulateMovement(DeltaSeconds);
 }

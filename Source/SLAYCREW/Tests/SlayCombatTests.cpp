@@ -64,6 +64,7 @@ bool FSlayCombatTest::RunTest(const FString& Parameters)
  SlayTests::FWorld Fixture;
  ASlayFighterCharacter* Player = Fixture.Spawn<ASlayFighterCharacter>();
  ASlayFighterCharacter* Target = Fixture.Spawn<ASlayFighterCharacter>(FVector(120, 0, 0));
+ Target->Melee->CombatGroup = TEXT("Hostile");
  Player->DispatchBeginPlay();
  Target->DispatchBeginPlay();
  // Multiple target primitives must still produce only one damage application.
@@ -177,6 +178,7 @@ bool FSlayOcclusionTest::RunTest(const FString& Parameters)
  SlayTests::FWorld Fixture;
  ASlayFighterCharacter* Player = Fixture.Spawn<ASlayFighterCharacter>();
  ASlayFighterCharacter* Target = Fixture.Spawn<ASlayFighterCharacter>(FVector(120, 0, 0));
+ Target->Melee->CombatGroup = TEXT("Hostile");
  Player->DispatchBeginPlay();
  Target->DispatchBeginPlay();
  AActor* Wall = Fixture.Spawn<AActor>(FVector(60, 0, 0));
@@ -200,6 +202,74 @@ bool FSlayOcclusionTest::RunTest(const FString& Parameters)
  Target->SetActorLocation(FVector(500, 0, 0));
  Player->Melee->TryStartAttack();
  TestEqual(TEXT("Out of range misses"), Target->Health->GetCurrentHealth(), 100.f);
+ return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSlayEligibilityTest, "SLAYCREW.Combat.TargetEligibility",
+ EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FSlayEligibilityTest::RunTest(const FString& Parameters)
+{
+ SlayTests::FWorld Fixture;
+ auto* Player = Fixture.Spawn<ASlayFighterCharacter>();
+ auto* Ally = Fixture.Spawn<ASlayCompanionCharacter>(FVector(120, 0, 0));
+ Player->DispatchBeginPlay();
+ Ally->DispatchBeginPlay();
+ Fixture.Advance(0.02f);
+ TestFalse(TEXT("Party ally rejected"), Player->Melee->CanHitTarget(Ally));
+ TestFalse(TEXT("Companion rejects protagonist"), Ally->Melee->CanHitTarget(Player));
+ Player->Melee->TryStartAttack();
+ TestEqual(TEXT("Ally receives no sweep damage"), Ally->Health->GetCurrentHealth(), 100.f);
+ Fixture.Advance(0.7f);
+ Player->Melee->bAllowFriendlyFire = true;
+ TestTrue(TEXT("Friendly fire opt-in"), Player->Melee->CanHitTarget(Ally));
+ Player->Melee->TryStartAttack();
+ TestEqual(TEXT("Enabled friendly fire deals damage"), Ally->Health->GetCurrentHealth(), 75.f);
+ Player->Melee->bAllowFriendlyFire = false;
+ Ally->Melee->CombatGroup = TEXT("Hostile");
+ TestTrue(TEXT("Different group eligible"), Player->Melee->CanHitTarget(Ally));
+ Ally->Health->ApplyDamage(1000.f);
+ TestFalse(TEXT("Incapacitated hostile rejected"), Player->Melee->CanHitTarget(Ally));
+ Player->Melee->bAllowDepletedTargets = true;
+ TestTrue(TEXT("Explicit depleted eligibility rule"), Player->Melee->CanHitTarget(Ally));
+ Ally->Melee->CombatGroup = Player->Melee->CombatGroup;
+ TestFalse(TEXT("Depletion opt-in does not bypass ally rule"), Player->Melee->CanHitTarget(Ally));
+ TestFalse(TEXT("Self rejected"), Player->Melee->CanHitTarget(Player));
+ TestFalse(TEXT("Null rejected"), Player->Melee->CanHitTarget(nullptr));
+ return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSlayMovementRecoveryTest, "SLAYCREW.Combat.MovementLockAndRecovery",
+ EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FSlayMovementRecoveryTest::RunTest(const FString& Parameters)
+{
+ SlayTests::FWorld Fixture;
+ auto* Companion = Fixture.Spawn<ASlayCompanionCharacter>();
+ Companion->DispatchBeginPlay();
+ auto* Movement = Companion->GetCharacterMovement();
+ Movement->bRunPhysicsWithNoController = true;
+ Movement->SetMovementMode(MOVE_Flying);
+ Fixture.Advance(0.02f);
+ Companion->Health->ApplyDamage(1000.f);
+ const FVector Location = Companion->GetActorLocation();
+ Movement->Velocity = FVector(500, 0, 0);
+ Movement->AddImpulse(FVector(1000, 0, 0), true);
+ Companion->AddMovementInput(FVector::ForwardVector, 1.f, true);
+ Fixture.Advance(0.1f);
+ TestEqual(TEXT("Depleted mode disabled"), Movement->MovementMode, MOVE_None);
+ TestTrue(TEXT("Depleted position stays fixed"), Companion->GetActorLocation().Equals(Location));
+ TestTrue(TEXT("Velocity cleared"), Movement->Velocity.IsZero());
+ TestTrue(TEXT("Input consumed"), Companion->GetPendingMovementInputVector().IsZero());
+ Companion->Health->RecoverFromIncapacitation(1.f);
+ Fixture.Advance(0.02f);
+ TestEqual(TEXT("Prior mode restored"), Movement->MovementMode, MOVE_Flying);
+ Companion->AddMovementInput(FVector::ForwardVector, 1.f, true);
+ Fixture.Advance(0.02f);
+ TestTrue(TEXT("Recovered character actually moves"), Companion->GetActorLocation().X > Location.X);
+ Movement->DisableMovement();
+ Companion->Health->ApplyDamage(1000.f);
+ Fixture.Advance(0.02f);
+ Companion->Health->RecoverFromIncapacitation(1.f);
+ Fixture.Advance(0.02f);
+ TestEqual(TEXT("Preexisting movement disable preserved"), Movement->MovementMode, MOVE_None);
  return true;
 }
 #endif
