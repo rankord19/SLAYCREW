@@ -195,9 +195,13 @@ struct SLAYCREW_API FSLAYCREWPackageDependencyReport
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
 	bool bCompleteDependencyCoverageVerified = false;
 
-	/** Sandbox directory used during isolated prototype verification. */
+	/** Sandbox Content directory used during isolated prototype verification. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
 	FString SandboxDirectoryUsed;
+
+	/** Standalone temporary .uproject file created for isolated out-of-editor verification. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")
+	FString SandboxProjectFilePath;
 
 	/** Human-readable diagnostic summary when dependency resolution or sandbox staging fails. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DependencyReport")

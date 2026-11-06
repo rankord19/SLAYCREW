@@ -1,14 +1,19 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "CoreMinimal.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "Environment/SLAYCREWEnvironmentKitCatalog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectGlobals.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -303,7 +308,79 @@ bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Param
 		TestEqual(TEXT("Pre-existing colliding file was not overwritten"), PostCollisionBytes.Num(), ProtectedBytes.Num());
 	}
 
-	// Now execute full isolated sandbox prototype migration verification
+	// 2. Verify active-editor isolation while a temporary sandbox project is staged on disk (bCleanUpStagedFilesOnExit = false):
+	//    - Standalone GothicKitSandbox.uproject is created in the temporary project directory.
+	//    - Active editor's /Game/ mount point still resolves strictly to FPaths::ProjectContentDir().
+	//    - Active editor's IAssetRegistry contains 0 entries for the sandbox packages.
+	//    - Active editor's UPackage memory table contains 0 loaded sandbox packages.
+	{
+		ON_SCOPE_EXIT
+		{
+			USLAYCREWEnvironmentKitCatalog::CleanUpAbandonedStagingSandboxes();
+		};
+
+		const FString ProbePackageName(TEXT("/Game/Meshes/Candles/SM_Candles_01"));
+		const FString AssetExt(TEXT(".uasset"));
+		FString ActiveGameResolvedBefore;
+		TestTrue(
+			TEXT("FPackageName resolves /Game/Meshes/Candles/SM_Candles_01 before staging"),
+			FPackageName::TryConvertLongPackageNameToFilename(
+				ProbePackageName,
+				ActiveGameResolvedBefore,
+				AssetExt));
+
+		FSLAYCREWPackageDependencyReport IsolationReport;
+		const bool bStagedOk = USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
+			SourceContentDir,
+			{ FName(TEXT("/Game/Meshes/Candles/SM_Candles_01")) },
+			IsolationReport,
+			/*bCleanUpStagedFilesOnExit=*/false);
+
+		TestTrue(TEXT("Isolated temporary project staging succeeded"), bStagedOk);
+		TestTrue(
+			TEXT("Standalone temporary GothicKitSandbox.uproject file created on disk"),
+			IFileManager::Get().FileExists(*IsolationReport.SandboxProjectFilePath));
+
+		const FString CmdLine = USLAYCREWEnvironmentKitCatalog::BuildSeparateProcessVerificationCommandLine(
+			IsolationReport.SandboxProjectFilePath);
+		TestTrue(
+			TEXT("Out-of-process verification command line targets GothicKitSandbox.uproject"),
+			CmdLine.Contains(TEXT("GothicKitSandbox.uproject")));
+
+		// Check active editor /Game/ mount point while sandbox files are still on disk
+		FString ActiveGameResolvedDuring;
+		TestTrue(
+			TEXT("FPackageName resolves /Game/Meshes/Candles/SM_Candles_01 while sandbox is staged"),
+			FPackageName::TryConvertLongPackageNameToFilename(
+				ProbePackageName,
+				ActiveGameResolvedDuring,
+				AssetExt));
+		TestTrue(
+			TEXT("Active editor /Game/ mount point was never remounted to sandbox"),
+			FPaths::IsSamePath(ActiveGameResolvedBefore, ActiveGameResolvedDuring));
+
+		// Check active editor IAssetRegistry was not polluted by staged sandbox files
+		if (IAssetRegistry* ActiveRegistry = IAssetRegistry::Get())
+		{
+			TArray<FAssetData> PollutedAssets;
+			ActiveRegistry->GetAssetsByPackageName(FName(TEXT("/Game/Meshes/Candles/SM_Candles_01")), PollutedAssets);
+			TestEqual(TEXT("Active editor AssetRegistry has 0 entries from temporary sandbox"), PollutedAssets.Num(), 0);
+		}
+
+		// Check active editor UPackage memory was not polluted by loading sandbox packages in-process
+		TestNull(
+			TEXT("Active editor has not loaded /Game/Meshes/Candles/SM_Candles_01 into memory"),
+			FindPackage(nullptr, TEXT("/Game/Meshes/Candles/SM_Candles_01")));
+
+		TestTrue(
+			TEXT("CleanUpAbandonedStagingSandboxes removes retained sandbox project"),
+			USLAYCREWEnvironmentKitCatalog::CleanUpAbandonedStagingSandboxes());
+		TestFalse(
+			TEXT("Temporary GothicKitSandbox.uproject removed after cleanup"),
+			IFileManager::Get().FileExists(*IsolationReport.SandboxProjectFilePath));
+	}
+
+	// 3. Execute full isolated sandbox prototype migration verification with automatic scope-exit cleanup
 	FSLAYCREWPackageDependencyReport Report;
 	const bool bVerified = USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 		SourceContentDir,
@@ -311,7 +388,7 @@ bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Param
 		Report,
 		/*bCleanUpStagedFilesOnExit=*/true);
 
-	TestTrue(TEXT("All representative Gothic kit packages resolved and loaded in UE 5.8"), bVerified);
+	TestTrue(TEXT("All representative Gothic kit packages resolved and verified in isolated sandbox"), bVerified);
 	TestTrue(TEXT("Complete dependency coverage verified"), Report.bCompleteDependencyCoverageVerified);
 	TestEqual(TEXT("Zero missing package dependencies"), Report.MissingPackages.Num(), 0);
 	TestEqual(TEXT("Zero unreadable package dependencies"), Report.UnreadablePackages.Num(), 0);
@@ -327,11 +404,12 @@ bool FSLAYCREWEnvironmentKitPrototypeMigrationTest::RunTest(const FString& Param
 		FPaths::IsUnderDirectory(Report.SandboxDirectoryUsed, ActiveProjectContentDir));
 
 	AddInfo(FString::Printf(
-		TEXT("Prototype Dependency Closure: %d packages (%lld bytes / %.2f MB) staged in '%s'"),
+		TEXT("Prototype Dependency Closure: %d packages (%lld bytes / %.2f MB) staged in '%s' (Project='%s')"),
 		Report.TotalFiles,
 		Report.TotalBytes,
 		static_cast<double>(Report.TotalBytes) / (1024.0 * 1024.0),
-		*Report.SandboxDirectoryUsed));
+		*Report.SandboxDirectoryUsed,
+		*Report.SandboxProjectFilePath));
 
 	for (const FSLAYCREWVerifiedAssetLoadInfo& AssetInfo : Report.VerifiedAssets)
 	{

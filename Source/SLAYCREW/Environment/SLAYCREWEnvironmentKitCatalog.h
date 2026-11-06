@@ -12,7 +12,7 @@
  * Catalogs reusable Megascans/sample assets, classifies suitability for the Gothic academy setting,
  * tracks missing Gothic architectural elements, enforces modular grid snapping (including negative scale
  * for mirrored architectural modules), and provides AssetRegistry-backed dependency resolution and
- * isolated sandbox prototype verification.
+ * isolated temporary-project prototype verification.
  */
 UCLASS(BlueprintType)
 class SLAYCREW_API USLAYCREWEnvironmentKitCatalog : public UDataAsset
@@ -68,10 +68,9 @@ public:
 	static bool IsTransformAlignedToGrid(const FTransform& InTransform, const FSLAYCREWModularSnapSpec& SnapSpec, float Tolerance = 0.05f);
 
 	/**
-	 * Uses Unreal Engine's native IAssetRegistry::LoadPackageRegistryData and binary package tag verification
-	 * to inspect .uasset files in SourceContentDir and compute the transitive /Game/... package dependency closure.
-	 * Validates package readability, categorizes /Engine/ and /Script/ vs unsupported dependencies,
-	 * and sets OutReport.bCompleteDependencyCoverageVerified only when full coverage is verified.
+	 * Uses Unreal Engine's stateless const IAssetRegistry::LoadPackageRegistryData and binary package header
+	 * verification to inspect .uasset files in SourceContentDir and compute the transitive /Game/... package
+	 * dependency closure without mutating the active editor's AssetRegistry, mount points, or loaded objects.
 	 * Never modifies the source project.
 	 */
 	static bool ResolveSourcePackageDependencies(
@@ -80,21 +79,24 @@ public:
 		FSLAYCREWPackageDependencyReport& OutReport);
 
 	/**
-	 * Performs a dependency-aware prototype verification in UE 5.8 using an isolated temporary sandbox:
+	 * Performs a dependency-aware prototype verification using an isolated temporary Unreal project sandbox:
 	 * 1. Resolves and validates the transitive dependency closure via ResolveSourcePackageDependencies.
 	 * 2. Performs pre-flight collision checks against both the active project's Content directory and any custom staging root;
 	 *    never overwrites existing game assets and aborts prior to copying if any collision is detected.
-	 * 3. Stages .uasset files into an isolated sandbox directory under Saved/Temp/GothicKitSandbox/<RunId>/Content
-	 *    (or OptionalCustomSandboxContentDir), validating all paths, creating directories explicitly, and verifying copies.
-	 * 4. Temporarily mounts the sandbox Content directory to /Game/ via FPackageName::RegisterMountPoint, scans the staged
-	 *    packages with IAssetRegistry::ScanFilesSynchronous, and loads/verifies each root asset in UE 5.8.
-	 * 5. Unloads staged packages, unregisters the temporary mount point, and deletes all staged sandbox files on scope exit
-	 *    (including after ordinary failures).
+	 * 3. Creates a standalone temporary Unreal project (GothicKitSandbox.uproject + Content/) under
+	 *    Saved/Temp/GothicKitSandbox/<RunId>/ and stages the dependency-closed .uasset files there.
+	 * 4. Verifies every staged package in the temporary project's Content directory via stateless binary header
+	 *    and const IAssetRegistry::LoadPackageRegistryData inspection — NEVER remounting /Game/, NEVER calling
+	 *    ScanFilesSynchronous, and NEVER calling LoadPackage inside the active editor process.
+	 * 5. Deletes all staged sandbox files and the temporary project directory on scope exit when bCleanUpStagedFilesOnExit is true.
 	 *
-	 * NOTE ON CRASH RECOVERY: Because staging occurs in Saved/Temp/GothicKitSandbox outside the project's Content directory,
-	 * an abnormal process termination (crash / power loss / kill) will never leave untracked .uasset files in Content/.
-	 * Any leftover temporary directories under Saved/Temp/GothicKitSandbox can be removed via CleanUpAbandonedStagingSandboxes()
-	 * or by deleting Saved/Temp/GothicKitSandbox manually.
+	 * VERIFICATION SCOPE & LIMITATIONS:
+	 * - Verified in-process (zero interference with active editor): Binary FPackageFileSummary integrity, UE5 file version
+	 *   compatibility, transitive /Game/ and /Engine/ dependency closure completeness, FAssetData class and tags (LODs,
+	 *   Materials, ApproxSize bounds, Parent material), and standalone .uproject staging.
+	 * - Requires separate process: Full UObject deserialization (PostLoad), RHI resource creation, and shader compilation
+	 *   cannot be executed inside the active editor without mounting /Game/; use BuildSeparateProcessVerificationCommandLine()
+	 *   with bCleanUpStagedFilesOnExit=false to run UnrealEditor-Cmd.exe against OutReport.SandboxProjectFilePath in a separate OS process.
 	 */
 	static bool VerifyPrototypeMigrationInScopedSandbox(
 		const FString& SourceContentDir,
@@ -102,6 +104,12 @@ public:
 		FSLAYCREWPackageDependencyReport& OutReport,
 		bool bCleanUpStagedFilesOnExit = true,
 		const FString& OptionalCustomSandboxContentDir = FString());
+
+	/**
+	 * Builds the command-line arguments to invoke a separate UnrealEditor-Cmd.exe process against the generated
+	 * temporary SandboxProjectFilePath for out-of-process UObject load and shader verification.
+	 */
+	static FString BuildSeparateProcessVerificationCommandLine(const FString& SandboxProjectFilePath);
 
 	/** Removes any leftover temporary directories under Saved/Temp/GothicKitSandbox from prior interrupted runs. */
 	static bool CleanUpAbandonedStagingSandboxes();

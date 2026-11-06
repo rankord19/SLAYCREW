@@ -3,18 +3,13 @@
 #include "Environment/SLAYCREWEnvironmentKitCatalog.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/IAssetRegistry.h"
-#include "Engine/StaticMesh.h"
 #include "HAL/FileManager.h"
-#include "Materials/Material.h"
-#include "Materials/MaterialInstance.h"
-#include "Materials/MaterialInterface.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
 #include "SLAYCREW.h"
-#include "StaticMeshResources.h"
-#include "UObject/Linker.h"
 #include "UObject/Package.h"
 #include "UObject/PackageFileSummary.h"
 #include "UObject/UObjectGlobals.h"
@@ -96,6 +91,21 @@ namespace
 		const double Sign = (AxisScale < 0.0) ? -1.0 : 1.0;
 		const double SnappedMagnitude = FMath::Max(ScaleStep, FMath::GridSnap(FMath::Abs(AxisScale), ScaleStep));
 		return Sign * SnappedMagnitude;
+	}
+
+	bool ParseApproxSizeTag(const FString& ApproxSizeStr, FVector& OutSizeCm)
+	{
+		TArray<FString> Parts;
+		ApproxSizeStr.ParseIntoArray(Parts, TEXT("x"), /*InCullEmpty=*/true);
+		if (Parts.Num() != 3)
+		{
+			return false;
+		}
+
+		OutSizeCm.X = FCString::Atod(*Parts[0]);
+		OutSizeCm.Y = FCString::Atod(*Parts[1]);
+		OutSizeCm.Z = FCString::Atod(*Parts[2]);
+		return (OutSizeCm.X > 0.0 || OutSizeCm.Y > 0.0 || OutSizeCm.Z > 0.0);
 	}
 }
 
@@ -824,6 +834,14 @@ bool USLAYCREWEnvironmentKitCatalog::ResolveSourcePackageDependencies(
 	return true;
 }
 
+FString USLAYCREWEnvironmentKitCatalog::BuildSeparateProcessVerificationCommandLine(const FString& SandboxProjectFilePath)
+{
+	const FString NormalizedUProject = FPaths::ConvertRelativePathToFull(SandboxProjectFilePath);
+	return FString::Printf(
+		TEXT("\"%s\" -run=ResavePackages -VerifyOnly -ProjectOnly -Unattended -NOPAUSE -NullRHI -NoSplash -NoSound"),
+		*NormalizedUProject);
+}
+
 bool USLAYCREWEnvironmentKitCatalog::CleanUpAbandonedStagingSandboxes()
 {
 	const FString SandboxBaseDir = FPaths::ConvertRelativePathToFull(
@@ -848,7 +866,7 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 		return false;
 	}
 
-	IAssetRegistry* AssetRegistry = IAssetRegistry::Get();
+	const IAssetRegistry* AssetRegistry = IAssetRegistry::Get();
 	if (!AssetRegistry)
 	{
 		OutReport.FailureReason = TEXT("IAssetRegistry is unavailable.");
@@ -870,17 +888,24 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 		: FPaths::ConvertRelativePathToFull(OptionalCustomSandboxContentDir);
 	FPaths::NormalizeDirectoryName(SandboxContentDir);
 
+	const FString SandboxProjectRoot = FPaths::GetPath(SandboxContentDir);
+	const FString SandboxUProjectFile = FPaths::Combine(SandboxProjectRoot, TEXT("GothicKitSandbox.uproject"));
+
 	OutReport.SandboxDirectoryUsed = SandboxContentDir;
+	OutReport.SandboxProjectFilePath = SandboxUProjectFile;
 
 	if (!FPaths::ValidatePath(SandboxContentDir) ||
 		FPaths::IsSamePath(NormalizedSourceDir, SandboxContentDir) ||
 		FPaths::IsUnderDirectory(SandboxContentDir, NormalizedSourceDir) ||
-		FPaths::IsUnderDirectory(NormalizedSourceDir, SandboxContentDir))
+		FPaths::IsUnderDirectory(NormalizedSourceDir, SandboxContentDir) ||
+		FPaths::IsSamePath(ActiveProjectContentDir, SandboxContentDir) ||
+		FPaths::IsUnderDirectory(SandboxContentDir, ActiveProjectContentDir))
 	{
 		OutReport.FailureReason = FString::Printf(
-			TEXT("Unsafe or overlapping sandbox directory '%s' relative to source '%s'."),
+			TEXT("Unsafe or overlapping sandbox directory '%s' relative to source '%s' or active project Content '%s'."),
 			*SandboxContentDir,
-			*NormalizedSourceDir);
+			*NormalizedSourceDir,
+			*ActiveProjectContentDir);
 		return false;
 	}
 
@@ -915,9 +940,7 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 
 	TArray<FString> NewlyStagedFiles;
 	TArray<FString> NewlyCreatedDirs;
-	TArray<FString> AllTargetPackageFiles;
-	TArray<UPackage*> LoadedStagedPackages;
-	bool bMountPointRegistered = false;
+	bool bCreatedSandboxUProject = false;
 
 	// Note: If the process terminates abnormally (e.g. OS kill or hardware power loss), files staged in
 	// Saved/Temp/GothicKitSandbox outside ProjectContentDir can be cleaned up on next startup via
@@ -926,31 +949,14 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 	{
 		if (bCleanUpStagedFilesOnExit)
 		{
-			for (UPackage* Pkg : LoadedStagedPackages)
-			{
-				if (Pkg)
-				{
-					ResetLoaders(Pkg);
-				}
-			}
-
-			for (const FName& PkgName : OutReport.ResolvedDependencyPackages)
-			{
-				if (UPackage* ExistingPkg = FindPackage(nullptr, *PkgName.ToString()))
-				{
-					ResetLoaders(ExistingPkg);
-				}
-			}
-
-			if (bMountPointRegistered)
-			{
-				FPackageName::UnRegisterMountPoint(TEXT("/Game/"), SandboxContentDir);
-				bMountPointRegistered = false;
-			}
-
 			for (const FString& StagedFile : NewlyStagedFiles)
 			{
 				IFileManager::Get().Delete(*StagedFile, /*RequireExists=*/false, /*EvenReadOnly=*/true, /*Quiet=*/true);
+			}
+
+			if (bCreatedSandboxUProject)
+			{
+				IFileManager::Get().Delete(*SandboxUProjectFile, /*RequireExists=*/false, /*EvenReadOnly=*/true, /*Quiet=*/true);
 			}
 
 			NewlyCreatedDirs.Sort([](const FString& A, const FString& B) { return A.Len() > B.Len(); });
@@ -971,7 +977,7 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 		}
 	};
 
-	// 1. Ensure sandbox root exists and stage all dependency-resolved .uasset files into SandboxContentDir
+	// 1. Create standalone temporary Unreal project descriptor (GothicKitSandbox.uproject) and Content directory
 	if (!IFileManager::Get().MakeDirectory(*SandboxContentDir, /*Tree=*/true) ||
 		!IFileManager::Get().DirectoryExists(*SandboxContentDir))
 	{
@@ -982,6 +988,21 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 	}
 	NewlyCreatedDirs.AddUnique(SandboxContentDir);
 
+	if (!IFileManager::Get().FileExists(*SandboxUProjectFile))
+	{
+		const FString MinimalUProjectJson =
+			TEXT("{\n\t\"FileVersion\": 3,\n\t\"EngineAssociation\": \"5.8\",\n\t\"Category\": \"\",\n\t\"Description\": \"Isolated Gothic Environment Kit Verification Sandbox\"\n}\n");
+		if (!FFileHelper::SaveStringToFile(MinimalUProjectJson, *SandboxUProjectFile))
+		{
+			OutReport.FailureReason = FString::Printf(
+				TEXT("Failed to write temporary sandbox project descriptor '%s'."),
+				*SandboxUProjectFile);
+			return false;
+		}
+		bCreatedSandboxUProject = true;
+	}
+
+	// 2. Stage all dependency-resolved .uasset files into the temporary project's Content directory
 	for (const FName& PkgName : OutReport.ResolvedDependencyPackages)
 	{
 		FString SrcFile;
@@ -1050,42 +1071,21 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 				*DstFile);
 			return false;
 		}
-
-		AllTargetPackageFiles.Add(DstFile);
 	}
 
-	// 2. Temporarily mount SandboxContentDir to /Game/ and scan staged files in UE 5.8 AssetRegistry
-	FPackageName::RegisterMountPoint(TEXT("/Game/"), SandboxContentDir);
-	bMountPointRegistered = true;
-
-	AssetRegistry->ScanFilesSynchronous(AllTargetPackageFiles, /*bForceRescan=*/true);
-
-	// 3. Load and verify each root asset in UE 5.8
+	// 3. Verify each staged root package in the temporary project's Content directory using stateless,
+	// const IAssetRegistry::LoadPackageRegistryData and binary header checks.
+	// IMPORTANT: Never call FPackageName::RegisterMountPoint("/Game/", ...), ScanFilesSynchronous, or LoadPackage
+	// inside the active editor process so active editor package resolution, loaded assets, and AssetRegistry remain untouched.
 	bool bAllRootsVerified = true;
 	for (const FName& RootPkg : RootPackageNames)
 	{
 		FSLAYCREWVerifiedAssetLoadInfo Info;
 		Info.PackageName = RootPkg;
 
-		FString SrcFile;
-		ConvertGamePackageToFilename(NormalizedSourceDir, RootPkg, SrcFile);
-		IAssetRegistry::FLoadPackageRegistryData RootData(/*bInGetDependencies=*/false);
-		AssetRegistry->LoadPackageRegistryData(SrcFile, RootData);
-
-		const FString PkgStr = RootPkg.ToString();
-		if (!RootData.Data.IsEmpty())
-		{
-			Info.AssetClassName = RootData.Data[0].AssetClassPath.GetAssetName().ToString();
-		}
-
-		UPackage* LoadedPkg = LoadPackage(nullptr, *PkgStr, LOAD_None);
-		UObject* LoadedObj = LoadedPkg ? LoadedPkg->FindAssetInPackage() : nullptr;
-		if (!LoadedObj && LoadedPkg)
-		{
-			const FString ShortAssetName = FPackageName::GetLongPackageAssetName(PkgStr);
-			LoadedObj = FindObject<UObject>(LoadedPkg, *ShortAssetName);
-		}
-		if (!LoadedObj)
+		FString StagedRootFile;
+		if (!ConvertGamePackageToFilename(SandboxContentDir, RootPkg, StagedRootFile) ||
+			!HasValidUnrealPackageHeader(StagedRootFile))
 		{
 			Info.bLoadedSuccessfully = false;
 			bAllRootsVerified = false;
@@ -1093,45 +1093,89 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 			continue;
 		}
 
-		LoadedStagedPackages.AddUnique(LoadedObj->GetOutermost());
-		Info.AssetClassName = LoadedObj->GetClass()->GetName();
-		Info.bLoadedSuccessfully = true;
-
-		if (UStaticMesh* StaticMesh = Cast<UStaticMesh>(LoadedObj))
+		IAssetRegistry::FLoadPackageRegistryData StagedRootData(/*bInGetDependencies=*/true);
+		AssetRegistry->LoadPackageRegistryData(StagedRootFile, StagedRootData);
+		if (StagedRootData.Data.IsEmpty())
 		{
-			Info.NumLODs = StaticMesh->GetNumLODs();
-			Info.NumMaterialSlots = StaticMesh->GetStaticMaterials().Num();
-			Info.BoundingBoxSizeCm = StaticMesh->GetBounds().BoxExtent * 2.0f;
+			Info.bLoadedSuccessfully = false;
+			bAllRootsVerified = false;
+			OutReport.VerifiedAssets.Add(MoveTemp(Info));
+			continue;
+		}
 
-			if (UMaterialInterface* Mat0 = StaticMesh->GetMaterial(0))
+		// Verify all direct /Game/... dependencies of this staged root package exist in SandboxContentDir
+		bool bAllStagedDepsPresent = true;
+		FName DiscoveredMaterialDependency = NAME_None;
+		for (const FName& DepPkg : StagedRootData.DataDependencies)
+		{
+			const FString DepStr = DepPkg.ToString();
+			if (DepStr.StartsWith(TEXT("/Game/"), ESearchCase::IgnoreCase))
 			{
-				Info.ResolvedMaterialOrParentName = FName(*Mat0->GetPathName());
-				LoadedStagedPackages.AddUnique(Mat0->GetOutermost());
-				if (UMaterial* BaseMat = Mat0->GetBaseMaterial())
+				FString StagedDepFile;
+				if (!ConvertGamePackageToFilename(SandboxContentDir, DepPkg, StagedDepFile) ||
+					!IFileManager::Get().FileExists(*StagedDepFile) ||
+					!HasValidUnrealPackageHeader(StagedDepFile))
 				{
-					LoadedStagedPackages.AddUnique(BaseMat->GetOutermost());
+					bAllStagedDepsPresent = false;
+					break;
+				}
+
+				if (DiscoveredMaterialDependency.IsNone() &&
+					(DepStr.Contains(TEXT("/MI_")) || DepStr.Contains(TEXT("/M_")) || DepStr.StartsWith(TEXT("/Game/Materials/"))))
+				{
+					DiscoveredMaterialDependency = DepPkg;
 				}
 			}
-
-			if (Info.NumLODs <= 0 || Info.BoundingBoxSizeCm.IsNearlyZero())
-			{
-				Info.bLoadedSuccessfully = false;
-				bAllRootsVerified = false;
-			}
 		}
-		else if (UMaterialInterface* MatInterface = Cast<UMaterialInterface>(LoadedObj))
+
+		if (!bAllStagedDepsPresent)
+		{
+			Info.bLoadedSuccessfully = false;
+			bAllRootsVerified = false;
+			OutReport.VerifiedAssets.Add(MoveTemp(Info));
+			continue;
+		}
+
+		const FAssetData& PrimaryAssetData = StagedRootData.Data[0];
+		Info.AssetClassName = PrimaryAssetData.AssetClassPath.GetAssetName().ToString();
+		Info.ResolvedMaterialOrParentName = DiscoveredMaterialDependency;
+
+		if (Info.AssetClassName == TEXT("StaticMesh"))
+		{
+			PrimaryAssetData.GetTagValue(FName(TEXT("LODs")), Info.NumLODs);
+			PrimaryAssetData.GetTagValue(FName(TEXT("Materials")), Info.NumMaterialSlots);
+
+			FString ApproxSizeStr;
+			if (PrimaryAssetData.GetTagValue(FName(TEXT("ApproxSize")), ApproxSizeStr))
+			{
+				ParseApproxSizeTag(ApproxSizeStr, Info.BoundingBoxSizeCm);
+			}
+
+			Info.bLoadedSuccessfully =
+				(Info.NumLODs > 0) &&
+				(Info.NumMaterialSlots > 0) &&
+				!Info.BoundingBoxSizeCm.IsNearlyZero() &&
+				!Info.ResolvedMaterialOrParentName.IsNone();
+		}
+		else if (Info.AssetClassName.Contains(TEXT("Material")))
 		{
 			Info.NumMaterialSlots = 1;
-			if (UMaterial* BaseMat = MatInterface->GetBaseMaterial())
+			FString ParentTagValue;
+			if (PrimaryAssetData.GetTagValue(FName(TEXT("Parent")), ParentTagValue) && !ParentTagValue.IsEmpty())
 			{
-				Info.ResolvedMaterialOrParentName = FName(*BaseMat->GetPathName());
-				LoadedStagedPackages.AddUnique(BaseMat->GetOutermost());
+				Info.ResolvedMaterialOrParentName = FName(*ParentTagValue);
 			}
-			else
-			{
-				Info.bLoadedSuccessfully = false;
-				bAllRootsVerified = false;
-			}
+
+			Info.bLoadedSuccessfully = !Info.ResolvedMaterialOrParentName.IsNone();
+		}
+		else
+		{
+			Info.bLoadedSuccessfully = !Info.AssetClassName.IsEmpty();
+		}
+
+		if (!Info.bLoadedSuccessfully)
+		{
+			bAllRootsVerified = false;
 		}
 
 		OutReport.VerifiedAssets.Add(MoveTemp(Info));
@@ -1139,7 +1183,7 @@ bool USLAYCREWEnvironmentKitCatalog::VerifyPrototypeMigrationInScopedSandbox(
 
 	if (!bAllRootsVerified && OutReport.FailureReason.IsEmpty())
 	{
-		OutReport.FailureReason = TEXT("One or more root packages failed to load or validate in UE 5.8.");
+		OutReport.FailureReason = TEXT("One or more staged root packages failed binary header or AssetRegistry tag verification.");
 	}
 
 	return bAllRootsVerified;
