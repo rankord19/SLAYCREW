@@ -1,5 +1,8 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
+#include "Components/SlayStaminaComponent.h"
+#include "Combat/SlayComboComponent.h"
+#include "Prototype/SlayPrototype.h"
 #include "Combat/SlayFighterCharacter.h"
 #include "Combat/SlayMeleeComponent.h"
 #include "Combat/SlayInjuryComponent.h"
@@ -270,6 +273,117 @@ bool FSlayMovementRecoveryTest::RunTest(const FString& Parameters)
  Companion->Health->RecoverFromIncapacitation(1.f);
  Fixture.Advance(0.02f);
  TestEqual(TEXT("Preexisting movement disable preserved"), Movement->MovementMode, MOVE_None);
+ return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSlayStaminaTest, "SLAYCREW.Prototype.StaminaAndRejection",
+ EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FSlayStaminaTest::RunTest(const FString& Parameters)
+{
+ SlayTests::FWorld Fixture;
+ auto* Player = Fixture.Spawn<ASlayPrototypeCharacter>();
+ Player->DummyAttackInterval = 1000.f;
+ Player->DispatchBeginPlay();
+ TestTrue(TEXT("Spend exact balance"), Player->Stamina->TrySpend(100.f));
+ TestFalse(TEXT("No overdraft"), Player->Stamina->TrySpend(1.f));
+ TestFalse(TEXT("Negative cost rejected"), Player->Stamina->TrySpend(-1.f));
+ TestFalse(TEXT("Attack rejected without stamina"), Player->Combo->Open(ESlayOpeningDirection::Right));
+ TestEqual(TEXT("Rejected combo stays idle"), Player->Combo->Strike, 0);
+ Fixture.Advance(.5f);
+ TestEqual(TEXT("Delay prevents regeneration"), Player->Stamina->GetCurrent(), 0.f);
+ Fixture.Advance(.7f);
+ TestTrue(TEXT("Regeneration begins after delay"), Player->Stamina->GetCurrent() > 0.f);
+ Fixture.Advance(5.f);
+ TestEqual(TEXT("Regeneration caps at maximum"), Player->Stamina->GetCurrent(), 100.f);
+ return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSlayComboTest, "SLAYCREW.Prototype.BufferAndFiniteCombo",
+ EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FSlayComboTest::RunTest(const FString& Parameters)
+{
+ SlayTests::FWorld Fixture;
+ auto* Player = Fixture.Spawn<ASlayPrototypeCharacter>();
+ Player->DispatchBeginPlay();
+ Player->Stamina->RegenPerSecond = 0;
+ TestTrue(TEXT("Opening starts"), Player->Combo->Open(ESlayOpeningDirection::Left));
+ TestEqual(TEXT("One charge at startup"), Player->Stamina->GetCurrent(), 72.f);
+ Player->Combo->Queue();
+ TestEqual(TEXT("Buffer is free"), Player->Stamina->GetCurrent(), 72.f);
+ Fixture.Advance(.5f); // First early input expires; now buffer just before recovery ends.
+ Player->Combo->Queue();
+ Fixture.Advance(.22f);
+ TestEqual(TEXT("Buffered followup executes"), Player->Combo->Strike, 2);
+ TestEqual(TEXT("Exactly one followup charge"), Player->Stamina->GetCurrent(), 44.f);
+ TestEqual(TEXT("Opening direction retained"), Player->Combo->Opening, ESlayOpeningDirection::Left);
+ Fixture.Advance(.48f);
+ Player->Combo->Queue();
+ Fixture.Advance(.24f);
+ TestEqual(TEXT("Third strike executes"), Player->Combo->Strike, 3);
+ Player->Combo->Queue();
+ Fixture.Advance(.8f);
+ TestEqual(TEXT("Finite combo ends"), Player->Combo->Strike, 0);
+ TestEqual(TEXT("No fourth charge"), Player->Stamina->GetCurrent(), 16.f);
+ return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSlayComboExpiryTest, "SLAYCREW.Prototype.BufferExpiryAndDeath",
+ EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FSlayComboExpiryTest::RunTest(const FString& Parameters)
+{
+ SlayTests::FWorld Fixture;
+ auto* Player = Fixture.Spawn<ASlayPrototypeCharacter>();
+ Player->DispatchBeginPlay();
+ Player->Stamina->RegenPerSecond = 0;
+ Player->Combo->Open(ESlayOpeningDirection::Up);
+ Player->Combo->Queue();
+ Fixture.Advance(1.f);
+ TestEqual(TEXT("Expired input does not continue"), Player->Combo->Strike, 0);
+ TestEqual(TEXT("Expired input never charged"), Player->Stamina->GetCurrent(), 72.f);
+ Player->Combo->Open(ESlayOpeningDirection::Down);
+ Fixture.Advance(.4f);
+ Player->Combo->Queue();
+ Player->Melee->CancelAttack();
+ TestEqual(TEXT("Recovery cancellation clears queued combo"), Player->Combo->Strike, 0);
+ Fixture.Advance(.4f);
+ Player->Combo->Open(ESlayOpeningDirection::Down);
+ Player->Combo->Queue();
+ Player->Health->ApplyDamage(1000);
+ Fixture.Advance(.04f);
+ TestEqual(TEXT("Death clears combo"), Player->Combo->Strike, 0);
+ TestFalse(TEXT("Dead player cannot attack"), Player->Melee->TryStartAttack());
+ TestEqual(TEXT("Death disables movement"), Player->GetCharacterMovement()->MovementMode, MOVE_None);
+ return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSlayDirectionTest, "SLAYCREW.Prototype.OpeningDirections",
+ EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FSlayDirectionTest::RunTest(const FString& Parameters)
+{
+ TestEqual(TEXT("Tiny gesture defaults right"), USlayComboComponent::Recognize(FVector2D(-1, 1), 12), ESlayOpeningDirection::Right);
+ TestEqual(TEXT("Left"), USlayComboComponent::Recognize(FVector2D(-30, 5), 12), ESlayOpeningDirection::Left);
+ TestEqual(TEXT("Right"), USlayComboComponent::Recognize(FVector2D(30, 5), 12), ESlayOpeningDirection::Right);
+ TestEqual(TEXT("Up"), USlayComboComponent::Recognize(FVector2D(1, 30), 12), ESlayOpeningDirection::Up);
+ TestEqual(TEXT("Down"), USlayComboComponent::Recognize(FVector2D(1, -30), 12), ESlayOpeningDirection::Down);
+ return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSlayStartupTest, "SLAYCREW.Prototype.StartupAndDamageExchange",
+ EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FSlayStartupTest::RunTest(const FString& Parameters)
+{
+ SlayTests::FWorld Fixture;
+ auto* Player = Fixture.Spawn<ASlayPrototypeCharacter>();
+ auto* Enemy = Fixture.Spawn<ASlayFighterCharacter>(FVector(120, 0, 0));
+ Enemy->Melee->CombatGroup = TEXT("Enemy");
+ Enemy->SetActorRotation(FRotator(0, 180, 0));
+ Player->DispatchBeginPlay(); Enemy->DispatchBeginPlay();
+ Fixture.Advance(.02f);
+ Player->Combo->Open(ESlayOpeningDirection::Right);
+ TestEqual(TEXT("No damage during startup"), Enemy->Health->GetCurrentHealth(), 100.f);
+ Fixture.Advance(.24f);
+ TestEqual(TEXT("Active strike hits"), Enemy->Health->GetCurrentHealth(), 75.f);
+ Fixture.Advance(.08f);
+ TestEqual(TEXT("Continuous sweep does not duplicate"), Enemy->Health->GetCurrentHealth(), 75.f);
+ TestTrue(TEXT("Hit result preserved"), Player->Melee->LastHit.GetActor() == Enemy);
+ Enemy->Melee->TryStartAttack();
+ TestEqual(TEXT("Enemy can damage player"), Player->Health->GetCurrentHealth(), 75.f);
  return true;
 }
 #endif

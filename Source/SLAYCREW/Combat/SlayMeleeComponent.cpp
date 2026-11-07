@@ -1,4 +1,5 @@
 #include "Combat/SlayMeleeComponent.h"
+#include "Components/SlayStaminaComponent.h"
 #include "Components/SlayHealthComponent.h"
 #include "Combat/SlayInjuryComponent.h"
 #include "Engine/World.h"
@@ -47,18 +48,25 @@ void USlayMeleeComponent::ServerRequestAttack_Implementation() { TryStartAttack(
 bool USlayMeleeComponent::TryStartAttack()
 {
  if (!GetOwner()->HasAuthority() || !CanAttack()) { return false; }
+ if (auto* Stamina = GetOwner()->FindComponentByClass<USlayStaminaComponent>())
+ { if (!Stamina->TrySpend(StaminaCost)) { return false; } }
+ else if (StaminaCost > 0.f) { return false; }
  const float Speed = Injury ? FMath::Clamp(Injury->GetAttackSpeedMultiplier(), 0.1f, 1.f) : 1.f;
  const double Now = GetWorld()->GetTimeSeconds();
- AttackEnds = Now + FMath::Max(0.01f, AttackDuration) / Speed;
+ ActiveAt = Now + FMath::Max(0.f, StartupDuration) / Speed;
+ AttackEnds = ActiveAt + FMath::Max(0.01f, AttackDuration) / Speed;
  ReadyAt = AttackEnds + FMath::Max(0.01f, Cooldown) / Speed;
  HitActors.Reset();
- SetState(ESlayAttackState::Attacking);
+ SetState(StartupDuration > 0.f ? ESlayAttackState::Startup : ESlayAttackState::Attacking);
  if (!Health->IsDepleted() && State == ESlayAttackState::Attacking) { Sweep(); }
  return true;
 }
 void USlayMeleeComponent::CancelAttack()
 {
- if (GetOwner() && GetOwner()->HasAuthority() && State == ESlayAttackState::Attacking) { SetState(ESlayAttackState::Cooldown); }
+ if (!GetOwner() || !GetOwner()->HasAuthority()) { return; }
+ if (State == ESlayAttackState::Attacking || State == ESlayAttackState::Startup)
+ { SetState(ESlayAttackState::Cooldown); }
+ OnAttackCancelled.Broadcast();
 }
 void USlayMeleeComponent::HealthChanged(float Previous, float Current) { if (Current <= 0) { CancelAttack(); } }
 void USlayMeleeComponent::TickComponent(float Delta, ELevelTick TickType, FActorComponentTickFunction* Function)
@@ -66,6 +74,10 @@ void USlayMeleeComponent::TickComponent(float Delta, ELevelTick TickType, FActor
  Super::TickComponent(Delta, TickType, Function);
  if (!GetOwner()->HasAuthority()) { return; }
  const double Now = GetWorld()->GetTimeSeconds();
+ if (State == ESlayAttackState::Startup && Now >= ActiveAt)
+ {
+  SetState(Health && !Health->IsDepleted() ? ESlayAttackState::Attacking : ESlayAttackState::Cooldown);
+ }
  if (State == ESlayAttackState::Attacking)
  {
   if (!Health || Health->IsDepleted() || Now >= AttackEnds) { SetState(ESlayAttackState::Cooldown); }
@@ -108,6 +120,8 @@ void USlayMeleeComponent::Sweep()
   FHitResult Obstruction;
   if (GetWorld()->LineTraceSingleByChannel(Obstruction, Start, Target->GetActorLocation(), ECC_Visibility, SightParams)) { continue; }
   HitActors.Add(Target); // Before damage callbacks: reentrant events cannot damage the same target twice.
+  LastHit = Hit;
+  ++HitSerial;
   const APawn* Pawn = Cast<APawn>(GetOwner());
   UGameplayStatics::ApplyDamage(Target, Damage, Pawn ? Pawn->GetController() : nullptr, GetOwner(), nullptr);
  }

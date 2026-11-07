@@ -4,7 +4,8 @@
 #include "SlayMeleeComponent.generated.h"
 
 UENUM(BlueprintType)
-enum class ESlayAttackState : uint8 { Idle, Attacking, Cooldown };
+enum class ESlayAttackState : uint8 { Idle, Attacking, Cooldown, Startup };
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FSlayAttackCancelled);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSlayAttackChanged, ESlayAttackState, State);
 
 /** Server-owned short sweep window. Clients request attacks, never supply hits or damage. */
@@ -29,11 +30,17 @@ public:
  UFUNCTION(BlueprintNativeEvent, Category="Combat|Eligibility") bool IsFriendlyTarget(AActor* Target) const;
  /** Override for teams, PvP rules or weapon-specific target filters. Runs on authority. */
  UFUNCTION(BlueprintNativeEvent, Category="Combat") bool CanHitTarget(AActor* Target) const;
+ UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="0")) float StartupDuration = 0.f;
+ UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="0")) float StaminaCost = 0.f;
+ /** Last accepted sweep hit retained for future hit zones. */
+ UPROPERTY(BlueprintReadOnly, Category="Combat") FHitResult LastHit;
+ UPROPERTY(BlueprintReadOnly, Category="Combat") int32 HitSerial = 0;
  UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="0")) float Damage = 25.f;
  UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="1")) float Reach = 150.f;
  UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="1")) float Radius = 35.f;
  UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="0.01")) float AttackDuration = 0.15f;
  UPROPERTY(EditDefaultsOnly, Category="Combat", meta=(ClampMin="0.01")) float Cooldown = 0.45f;
+ UPROPERTY(BlueprintAssignable, Category="Combat") FSlayAttackCancelled OnAttackCancelled;
  UPROPERTY(BlueprintAssignable, Category="Combat") FSlayAttackChanged OnAttackStateChanged;
 protected:
  virtual void BeginPlay() override;
@@ -43,6 +50,7 @@ private:
  UPROPERTY() TObjectPtr<class USlayHealthComponent> Health;
  UPROPERTY() TObjectPtr<class USlayInjuryComponent> Injury;
  TSet<TWeakObjectPtr<AActor>> HitActors;
+ double ActiveAt = 0;
  double AttackEnds = 0;
  double ReadyAt = 0;
  UFUNCTION(Server, Reliable) void ServerRequestAttack();
