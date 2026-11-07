@@ -613,7 +613,8 @@ bool FSlayNarrativeSaveLoadTest::RunTest(const FString& Parameters)
 	Invalid.Relationships.Add(Duplicate);
 	TestFalse(TEXT("Duplicate relationship rejected"), Target->ImportSaveData(Invalid, Messages));
 	Invalid = Loaded->Narrative;
-	Invalid.Decisions.Add(Invalid.Decisions[0]);
+	const FSlayDecisionRecord DuplicateDecision = Invalid.Decisions[0];
+	Invalid.Decisions.Add(DuplicateDecision);
 	TestFalse(TEXT("Duplicate decision rejected"), Target->ImportSaveData(Invalid, Messages));
 	Invalid = Loaded->Narrative;
 	Invalid.Chapter = -1;
